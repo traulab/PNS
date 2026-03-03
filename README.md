@@ -1,4 +1,4 @@
-# PNS with Nucleosome + Breakpoint Peak Calling (Fragmentomics scoring + peak calling)
+# PNS with Nucleosome + Breakpoint Peak Calling
 
 This repository/script computes **PNS (Probabilistic Nucleosome Score)** tracks from paired-end BAM files, plus coverage and dyad tracks, optionally randomizes fragments, smooths the PNS signal, and calls:
 
