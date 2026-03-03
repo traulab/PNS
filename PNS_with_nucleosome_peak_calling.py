@@ -18,8 +18,8 @@ What this script does (high level):
 7) Writes (configurable):
    - bedGraph (combined multi-track bedGraph; legacy behavior)
    - wig.gz (one file per track; fixedStep)
-   - a BED-like file of nucleosome regions with peak prominence + coverage metrics
-   - a BED-like file of breakpoint peaks with analogous metrics
+   - a BED file of nucleosome peaks
+   - a BED file of breakpoint peaks
 
 Randomization modes:
 - none: no randomization (default)
