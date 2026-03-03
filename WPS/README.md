@@ -350,17 +350,6 @@ Two files are always written:
 
 ---
 
-## Conda / Mamba environment setup
-
-Minimal environment:
-
-```bash
-mamba create -n wps_env -c conda-forge python=3.11 numpy scipy pysam tqdm
-conda activate wps_env
-```
-
----
-
 ## Notes
 
 - Input BAMs must be indexed (`.bai` in the same directory).
