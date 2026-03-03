@@ -568,8 +568,8 @@ def main():
         help='Limit to contig(s) and optional range, e.g. "12:51730340-52039340" or "12"',
     )
     parser.add_argument("--protection", type=int, default=120, help="Protection window (bp), default 120.")
-    parser.add_argument("--frag-lower", type=int, default=127, help="Lower fragment size to include in WPS")
-    parser.add_argument("--frag-upper", type=int, default=207, help="Upper fragment size to include in WPS")
+    parser.add_argument("--frag-lower", type=int, default=120, help="Lower fragment size to include in WPS")
+    parser.add_argument("--frag-upper", type=int, default=180, help="Upper fragment size to include in WPS")
     parser.add_argument("--max-duplicates", type=int, default=0, help="Maximum allowed duplicate fragments (same coords)")
     parser.add_argument("--subsample", type=float, default=None, help="Subsampling proportion (e.g. 0.5 keeps ~50%)")
     parser.add_argument("--chunk-bp", type=int, default=100000, help="Chunk size per contig")
