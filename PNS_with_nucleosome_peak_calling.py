@@ -8,9 +8,9 @@ Fragmentomics scoring + peak calling pipeline.
 What this script does (high level):
 1) Reads paired-end fragments from one or more BAMs in a region (or whole genome).
 2) Filters duplicates (same fragment coords) to max N and optionally subsamples.
-3) For each fragment length in a specified range, adds a precomputed "PNS-like" score
-   distribution across the fragment (or a padded version if shorter than mode length).
-4) Also computes simple coverage and a dyad count (fragment center) track.
+3) For each fragment length in a specified range, adds a precomputed PNS score
+   distribution across the fragment.
+4) Also computes simple coverage and a dyad count (fragment centre) track.
 5) Smooths the PNS track (Savitzky–Golay).
 6) Calls:
    - positive peaks ("nucleosome regions") on smoothed PNS
