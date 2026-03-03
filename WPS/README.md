@@ -30,9 +30,7 @@ It is designed to match **Martin Kircher’s 2015 WPS behavior** as closely as p
   - [Score tracks](#score-tracks)
   - [Peak calls](#peak-calls)
   - [Fragment summaries](#fragment-summaries)
-- [Converting to bigWig / bigBed](#converting-to-bigwig--bigbed)
-- [Conda / Mamba environment setup](#conda--mamba-environment-setup)
-- [Notes / gotchas](#notes--gotchas)
+- [Notes](#notes)
 
 ---
 
