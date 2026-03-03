@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-@author Andrew D Johnston 
+@author Andrew D Johnston
 @author Fiach Antaw
 
 Fragmentomics scoring + peak calling pipeline.
@@ -15,10 +15,19 @@ What this script does (high level):
 6) Calls:
    - positive peaks ("nucleosome regions") on smoothed PNS
    - negative peaks ("breakpoint peaks") by flipping the PNS sign and re-calling
-7) Writes:
-   - one combined bedGraph with multiple score tracks per base
+7) Writes (configurable):
+   - bedGraph (combined multi-track bedGraph; legacy behavior)
+   - wig.gz (one file per track; fixedStep)
    - a BED-like file of nucleosome regions with peak prominence + coverage metrics
    - a BED-like file of breakpoint peaks with analogous metrics
+
+Randomization modes:
+- none: no randomization (default)
+- uniform: uniformly randomize fragment start positions within each processed window
+- dinuc_anchor: for each fragment, choose to anchor on its start or end (probability
+  controlled by --anchor-prob-start), then place the fragment so its anchored boundary
+  dinucleotide matches a random occurrence of that dinucleotide in the reference sequence
+  for that window (requires --fasta)
 """
 
 import sys
@@ -27,158 +36,188 @@ import argparse
 import pysam
 import numpy as np
 import os
+import gzip
 from scipy.signal import savgol_filter
-from collections import defaultdict
+from collections import defaultdict, Counter
 import random
+from typing import Dict, List, Optional, Tuple
+
+DINUCS = [a + b for a in "ACGT" for b in "ACGT"]
 
 
-def generate_paired_reads(bamfile, contig=None, start=None, end=None,
-                          max_duplicates=0, subsample=None):
+def resolve_fasta_contig(fasta: pysam.FastaFile, contig: str) -> str:
     """
-    Iterate over reads in a BAM region and yield properly paired reads as (fwd, rev).
+    Resolve contig naming differences between BAM and FASTA.
 
-    Key behaviors:
-    - Uses query_name to match mates (not relying on BAM being name-sorted).
-    - Skips unmapped or mate-unmapped reads.
-    - Skips read-pairs mapped to the same strand (invalid for proper PE).
-    - Collapses duplicates: the same fragment coordinate tuple is allowed up to
-      max_duplicates occurrences.
-    - Optional subsample in [0..1]: keep each fragment with probability=subsample.
+    Tries:
+      contig
+      chr+contig
+      contig without leading 'chr'
     """
-    _unpaired_reads = dict()                 # store first mate until second appears
-    fragment_counts = defaultdict(int)       # duplicate counter by fragment coords
-    read_count = 0
-    subsample_removed_count = 0
+    refs = set(fasta.references)
+    if contig in refs:
+        return contig
+    if contig.startswith("chr"):
+        alt = contig[3:]
+        if alt in refs:
+            return alt
+    else:
+        alt = f"chr{contig}"
+        if alt in refs:
+            return alt
+    raise KeyError(
+        f"Contig '{contig}' not found in FASTA. Tried '{contig}', 'chr{contig}', and "
+        f"'{contig[3:]}' (if applicable)."
+    )
 
-    # NOTE: read_total is computed but not used (left from earlier progress logic)
+
+def is_softclipped_or_padded(cigartuples):
+    """Return True if CIGAR has S/H/P ops (soft clip, hard clip, pad)."""
+    if not cigartuples:
+        return False
+    for op, _ln in cigartuples:
+        if op in (4, 5, 6):  # 4=S, 5=H, 6=P
+            return True
+    return False
+
+
+def generate_paired_reads(
+    bamfile,
+    contig=None,
+    start=None,
+    end=None,
+    max_duplicates=0,
+    subsample=None,
+):
+    """
+    Shared paired-end generator used by BOTH PNS and WPS.
+
+    Behavior:
+      - fetch(contig,start,end) with multiple_iterators=True
+      - skip unmapped or mate-unmapped
+      - skip duplicate reads and QC-fail reads
+      - skip soft-clipped / hard-clipped / padded reads (CIGAR contains S/H/P)
+      - pair mates by query_name (works on coordinate-sorted BAMs)
+      - skip same-strand pairs
+      - define fragment coords as (ref_name, min(start), max(end))
+      - allow up to max_duplicates duplicates PER fragment coordinate (for non-deduplicated bams):
+            if frag_counts[key] > max_duplicates: skip
+        so max_duplicates=0 keeps exactly 1 instance, max_duplicates=1 keeps up to 2, etc.
+      - optional subsampling: keep with probability=subsample
+      - yields (fwd, rev) where fwd is the read on the forward strand
+    """
+    unpaired = {}
+    frag_counts = defaultdict(int)
+
     try:
-        read_total = sum(1 for _ in bamfile.fetch(contig, start, end, multiple_iterators=True))
-    except:
+        it = bamfile.fetch(contig, start, end, multiple_iterators=True)
+    except Exception:
         return
 
-    for read in bamfile.fetch(contig, start, end, multiple_iterators=True):
-
-        # Skip unmapped or mate-unmapped reads
+    for read in it:
         if read.is_unmapped or read.mate_is_unmapped:
             continue
-
-        # Ensure coordinates exist (some pathological records can lack these)
+        if read.is_duplicate or read.is_qcfail:
+            continue
+        if is_softclipped_or_padded(read.cigartuples):
+            continue
         if read.reference_end is None or read.next_reference_start is None:
             continue
 
-        name = read.query_name
-
-        # First time we see this query_name, store it and continue.
-        # Second time, we have the mate and can process the pair.
-        if name not in _unpaired_reads:
-            _unpaired_reads[name] = read
+        qn = read.query_name
+        if qn not in unpaired:
+            unpaired[qn] = read
             continue
 
-        mate = _unpaired_reads[name]
-        del _unpaired_reads[name]
+        mate = unpaired.pop(qn)
 
-        # Skip if both alignments are on same strand: improper / weird mapping
+        # Mate filters too (defensive)
+        if mate.is_unmapped or mate.mate_is_unmapped:
+            continue
+        if mate.is_duplicate or mate.is_qcfail:
+            continue
+        if is_softclipped_or_padded(mate.cigartuples):
+            continue
+        if mate.reference_end is None or mate.next_reference_start is None:
+            continue
+
+        # Must be opposite strands for proper PE
         if read.is_reverse == mate.is_reverse:
             continue
 
-        # Define the fragment by genomic coordinates spanning both mates.
-        # This is used to identify duplicate fragments.
-        fragment_key = (
-            read.reference_name,
-            min(read.reference_start, mate.reference_start),
-            max(read.reference_end, mate.reference_end),
-        )
-
-        # Enforce max_duplicates: allow only N fragments with identical coords
-        if fragment_counts[fragment_key] > max_duplicates:
-            continue
-        fragment_counts[fragment_key] += 1
-
-        # Optional subsampling: keep with probability=subsample
+        # Optional subsampling
         if subsample is not None and random.random() > subsample:
-            subsample_removed_count += 1
             continue
 
-        # Yield in (forward-strand read, reverse-strand read) order for consistency
+        frag_contig = read.reference_name
+        frag_start = min(read.reference_start, mate.reference_start)
+        frag_end = max(read.reference_end, mate.reference_end)
+        if frag_end <= frag_start:
+            continue
+
+        key = (frag_contig, frag_start, frag_end)
+        if frag_counts[key] > max_duplicates:
+            continue
+        frag_counts[key] += 1
+
+        # Yield (fwd, rev)
         if not read.is_reverse:
             yield read, mate
         else:
             yield mate, read
 
-        read_count += 1
 
-
-def generate_fragment_ranges(bamfile, contig, start, end, max_duplicates, subsample):
+def generate_fragment_ranges(
+    bamfile,
+    contig,
+    fetch_start,
+    fetch_end,
+    max_duplicates,
+    subsample,
+):
     """
     Convert paired reads into fragment genomic intervals (frag_start, frag_end).
-
-    Important:
-    - Enforces a consistent ordering and sanity checks to avoid inverted coords.
-    - Restricts fragments to those whose forward read starts within [start, end).
-      (Then coverage later further requires frag_end <= end.)
     """
-    for r_fwd, r_rev in generate_paired_reads(bamfile, contig, start, end, max_duplicates, subsample):
-        # Ensure r_fwd is the forward-strand read (defensive)
+    for r_fwd, r_rev in generate_paired_reads(
+        bamfile, contig, fetch_start, fetch_end, max_duplicates, subsample
+    ):
         if r_fwd.is_reverse:
             r_fwd, r_rev = r_rev, r_fwd
 
-        # Sanity checks to prevent weird/inverted pairs
         if r_fwd.reference_start > r_rev.reference_start:
             continue
         if r_rev.reference_end < r_fwd.reference_end:
             continue
 
-        # Only accept fragments whose *start* is inside the region
-        # (This avoids emitting fragments starting outside but overlapping in.)
-        if r_fwd.reference_start < start or r_fwd.reference_start >= end:
-            continue
-
-        # Fragment range is from leftmost start to rightmost end (end is exclusive)
         yield r_fwd.reference_start, r_rev.reference_end
 
 
 def precompute_distributions(pns_frag_range, mode_DNA_length):
     """
     Precompute per-fragment-length score “kernels” used to add PNS signal.
-
-    For each fragment length:
-    - Build a triangle score distribution over the first mode_DNA_length bases, 
-    - Mirror it from the fragment end
-    - Sum the start and end scores
-    - Center by subtracting the mean so each kernel sums ~0.
     """
     distributions = {}
-
     for fragment_length in pns_frag_range:
 
-        # If fragment is shorter than the mode length, expand the kernel length
-        # to accomodate the mode length extending beyond the fragment length at both ends
         if fragment_length < mode_DNA_length:
             total_length = mode_DNA_length + (mode_DNA_length - fragment_length)
         else:
             total_length = fragment_length
 
-        # This midpoint logic is based on the MODE length, not total_length:
-        # we create a triangle that rises to 1 at the midpoint of the mode-length window
-        # and falls back to 0 at the end of the mode-length window.
         midpoint = (mode_DNA_length - 1) // 2
         second_half_start = midpoint + 1
 
         scores = np.zeros(total_length)
 
-        # Build the "start" triangle only across the first mode_DNA_length positions.
-        # Past that (if total_length > mode_DNA_length), scores remain 0 here.
         for i in range(total_length):
             if i <= midpoint:
                 scores[i] = i / midpoint
             elif i <= mode_DNA_length - 1:
                 scores[i] = 1 - (i - second_half_start) / midpoint
 
-        # Mirror the distribution from the fragment end and sum:
         end_scores = scores[::-1]
         combined_scores = scores + end_scores
 
-        # Mean-center so the kernel has ~0 mean (prvents baseline drift)
         midpoint_val = np.mean(combined_scores)
         centered_scores = [x - midpoint_val for x in combined_scores]
 
@@ -187,112 +226,264 @@ def precompute_distributions(pns_frag_range, mode_DNA_length):
     return distributions
 
 
-def score_contig(bamfiles, contig, start, end, mode_DNA_length, pns_frag_range,
-                 max_duplicates, distributions, subsample):
+def build_dinuc_index(seq: str) -> Dict[str, List[int]]:
+    """
+    Build index of dinucleotide start positions in a sequence (window-relative).
+
+    Returns dict: dinuc -> list of i such that seq[i:i+2] == dinuc
+    """
+    idx = {d: [] for d in DINUCS}
+    L = len(seq)
+    for i in range(0, L - 1):
+        d = seq[i : i + 2]
+        if d in idx:
+            idx[d].append(i)
+    return idx
+
+
+def uniform_randomize_fragments(
+    fragments: List[Tuple[int, int]],
+    start: int,
+    end: int,
+) -> List[Tuple[int, int]]:
+    """
+    Uniformly randomize fragment start positions within [start,end), preserving lengths.
+    """
+    ref_len = end - start
+    randomized = []
+    for frag_start, frag_end in fragments:
+        L = frag_end - frag_start
+        if L <= 0 or L > ref_len:
+            continue
+        max_start = end - L
+        if max_start <= start:
+            continue
+        new_start = random.randint(start, max_start - 1)
+        randomized.append((new_start, new_start + L))
+    return randomized
+
+
+def dinuc_anchor_randomize_fragments(
+    fragments: List[Tuple[int, int]],
+    start: int,
+    end: int,
+    window_seq: str,
+    dinuc_pos: Dict[str, List[int]],
+    anchor_prob_start: float = 0.5,
+    max_anchor_tries: int = 30,
+    fallback: str = "uniform",  # uniform|keep|skip
+) -> List[Tuple[int, int]]:
+    """
+    Randomize fragments by anchoring on start or end dinucleotide.
+
+    For each fragment:
+      - compute start_dinuc and end_dinuc from window_seq using original coordinates
+      - choose anchor side: start with prob=anchor_prob_start else end
+      - pick a random occurrence of that dinuc in the window reference
+      - place fragment so its anchored boundary matches that occurrence
+      - require fragment fits fully inside [start,end)
+
+    fallback:
+      - uniform: if no placement found, place uniformly at random
+      - keep: keep original coordinates
+      - skip: drop fragment
+    """
+    ref_len = end - start
+    randomized: List[Tuple[int, int]] = []
+
+    for frag_start, frag_end in fragments:
+        L = frag_end - frag_start
+        if L <= 0 or L > ref_len:
+            if fallback == "keep":
+                randomized.append((frag_start, frag_end))
+            continue
+
+        s0 = frag_start - start
+        e0 = frag_end - start
+
+        if not (0 <= s0 <= ref_len - 2 and 2 <= e0 <= ref_len):
+            if fallback == "keep":
+                randomized.append((frag_start, frag_end))
+            elif fallback == "uniform":
+                randomized.extend(uniform_randomize_fragments([(frag_start, frag_end)], start, end))
+            continue
+
+        start_d = window_seq[s0 : s0 + 2]
+        end_d = window_seq[e0 - 2 : e0]
+
+        if start_d not in dinuc_pos or end_d not in dinuc_pos:
+            if fallback == "keep":
+                randomized.append((frag_start, frag_end))
+            elif fallback == "uniform":
+                randomized.extend(uniform_randomize_fragments([(frag_start, frag_end)], start, end))
+            continue
+
+        anchor_on_start = (random.random() < anchor_prob_start)
+
+        placed = False
+        if anchor_on_start:
+            candidates = dinuc_pos.get(start_d, [])
+            if candidates:
+                for _ in range(max_anchor_tries):
+                    i = random.choice(candidates)
+                    if i > ref_len - L:
+                        continue
+                    new_start = start + i
+                    new_end = new_start + L
+                    if new_end <= end:
+                        randomized.append((new_start, new_end))
+                        placed = True
+                        break
+        else:
+            candidates = dinuc_pos.get(end_d, [])
+            if candidates:
+                min_i = L - 2
+                max_i = ref_len - 2
+                for _ in range(max_anchor_tries):
+                    i = random.choice(candidates)
+                    if i < min_i or i > max_i:
+                        continue
+                    new_end = start + i + 2
+                    new_start = new_end - L
+                    if new_start >= start and new_end <= end:
+                        randomized.append((new_start, new_end))
+                        placed = True
+                        break
+
+        if not placed:
+            if fallback == "keep":
+                randomized.append((frag_start, frag_end))
+            elif fallback == "uniform":
+                randomized.extend(uniform_randomize_fragments([(frag_start, frag_end)], start, end))
+            elif fallback == "skip":
+                pass
+            else:
+                randomized.extend(uniform_randomize_fragments([(frag_start, frag_end)], start, end))
+
+    return randomized
+
+
+def score_contig(
+    bamfiles,
+    contig,
+    start,
+    end,
+    mode_DNA_length,
+    pns_frag_range,
+    max_duplicates,
+    distributions,
+    subsample,
+    randomize_mode: str = "none",  # none|uniform|dinuc_anchor
+    fasta: Optional[pysam.FastaFile] = None,
+    anchor_prob_start: float = 0.5,
+    max_anchor_tries: int = 30,
+    randomize_fallback: str = "uniform",  # uniform|keep|skip
+):
     """
     Score a genomic interval [start, end) on one contig.
 
-    Outputs 4 tracks (arrays length = end-start):
-    - coverage: +1 for each fragment (in range) for each base it covers
-    - dyad: +1 at the fragment center position
-    - pns: adds the length-specific precomputed kernel across the fragment footprint
-    - pns_smoothed: Savitzky–Golay filtered version of pns
+    Randomization (within this window) is applied BEFORE scoring if requested.
 
-    Coordinates & indexing:
-    - Arrays are 0-based relative to 'start' (the adjusted_start for the region).
-    - Later code converts these back to absolute genome coordinates when writing outputs.
+    Returns:
+      scores, pns_frag_range, fragments_filtered (post-filter/subsample/dup, post-randomize)
     """
     ref_len = end - start
     coverage = np.zeros(ref_len, dtype=int)
     dyad = np.zeros(ref_len, dtype=int)
     pns = np.zeros(ref_len, dtype=float)
 
-    filter_frag_count = 0
-    total_frag_count = 0
-
+    # 1) Collect all fragments for this window (after filtering/subsampling/dup logic)
+    fragments: List[Tuple[int, int]] = []
     for bamfile in bamfiles:
         for frag_start, frag_end in generate_fragment_ranges(
             bamfile, contig, start, end, max_duplicates, subsample
         ):
-            frag_length = frag_end - frag_start
-            total_frag_count += 1
+            fragments.append((frag_start, frag_end))
 
-            # Kernel for this fragment length (only defined for frag lengths in pns_frag_range)
-            fragment_scores = distributions.get(frag_length)
+    # 2) Randomize fragments if requested
+    if randomize_mode == "uniform" and fragments:
+        fragments = uniform_randomize_fragments(fragments, start, end)
 
-            # Add PNS-like kernel if fragment length in allowed range
-            if frag_length in pns_frag_range and fragment_scores:
+    elif randomize_mode == "dinuc_anchor" and fragments:
+        if fasta is None:
+            raise ValueError("randomize_mode=dinuc_anchor requires --fasta")
+        fasta_contig = resolve_fasta_contig(fasta, contig)
+        window_seq = fasta.fetch(fasta_contig, start, end).upper()
+        if len(window_seq) != ref_len:
+            window_seq = window_seq[:ref_len].ljust(ref_len, "N")
+        dinuc_pos = build_dinuc_index(window_seq)
 
-                # For short fragments, place the (expanded) kernel centered on the
-                # fragment center; for long fragments, place it over the fragment.
-                if frag_length < mode_DNA_length:
-                    total_length = mode_DNA_length + (mode_DNA_length - frag_length)
-                    fragment_center = frag_start + (frag_length // 2) - start
-                    start_pos = fragment_center - (total_length // 2)
-                    end_pos = start_pos + total_length
-                else:
-                    start_pos = frag_start - start
-                    end_pos = frag_end - start
+        fragments = dinuc_anchor_randomize_fragments(
+            fragments=fragments,
+            start=start,
+            end=end,
+            window_seq=window_seq,
+            dinuc_pos=dinuc_pos,
+            anchor_prob_start=anchor_prob_start,
+            max_anchor_tries=max_anchor_tries,
+            fallback=randomize_fallback,
+        )
 
-                # Clamp kernel to array bounds (region edges / overlap overhangs)
-                if start_pos < 0:
-                    fragment_scores = fragment_scores[-start_pos:]
-                    start_pos = 0
-                if end_pos > ref_len:
-                    fragment_scores = fragment_scores[:ref_len - start_pos]
+    # 3) Score (possibly randomized) fragments
+    for frag_start, frag_end in fragments:
+        frag_length = frag_end - frag_start
+        fragment_scores = distributions.get(frag_length)
 
-                # Add into pns track
-                if 0 <= start_pos < ref_len:
-                    pns[start_pos:start_pos + len(fragment_scores)] += fragment_scores[:end_pos - start_pos]
+        # Add PNS-like kernel if fragment length in allowed range
+        if frag_length in pns_frag_range and fragment_scores:
 
-            # Coverage and dyad are only computed for fragments entirely contained
-            # in the scoring region; also restricted to the allowed length range.
-            if frag_start >= start and frag_end <= end:
-                if frag_length in pns_frag_range:
-                    coverage[frag_start - start:frag_end - start] += 1
-                    filter_frag_count += 1
+            if frag_length < mode_DNA_length:
+                total_length = mode_DNA_length + (mode_DNA_length - frag_length)
+                fragment_center = frag_start + (frag_length // 2) - start
+                start_pos = fragment_center - (total_length // 2)
+                end_pos = start_pos + total_length
+            else:
+                start_pos = frag_start - start
+                end_pos = frag_end - start
 
-                    fragment_center = frag_start + (frag_length // 2) - start
-                    if 0 <= fragment_center < ref_len:
-                        dyad[fragment_center] += 1
+            if start_pos < 0:
+                fragment_scores = fragment_scores[-start_pos:]
+                start_pos = 0
+            if end_pos > ref_len:
+                fragment_scores = fragment_scores[: ref_len - start_pos]
 
-    # Smooth PNS to reduce noise before peak calling
+            if 0 <= start_pos < ref_len:
+                pns[start_pos : start_pos + len(fragment_scores)] += fragment_scores[
+                    : end_pos - start_pos
+                ]
+
+        # Coverage and dyad only for fragments fully contained, and within length range
+        if frag_start >= start and frag_end <= end:
+            if frag_length in pns_frag_range:
+                coverage[frag_start - start : frag_end - start] += 1
+                fragment_center = frag_start + (frag_length // 2) - start
+                if 0 <= fragment_center < ref_len:
+                    dyad[fragment_center] += 1
+
+    # 4) Smooth PNS
     window_size = 21
     polyorder = 2
-    pns_smoothed = savgol_filter(pns, window_size, polyorder)
+    if len(pns) >= window_size:
+        pns_smoothed = savgol_filter(pns, window_size, polyorder)
+    else:
+        pns_smoothed = pns.copy()
 
-    # Package as tuples: (contig, start_of_array_in_genome_coords, array)
-    # Note: start here is the *adjusted_start* used for this region.
     scores = {
-        'coverage': [(contig, start, coverage)],
-        'pns_smoothed': [(contig, start, pns_smoothed)],
-        'pns': [(contig, start, pns)],
-        'dyad': [(contig, start, dyad)],
+        "coverage": [(contig, start, coverage)],
+        "pns_smoothed": [(contig, start, pns_smoothed)],
+        "pns": [(contig, start, pns)],
+        "dyad": [(contig, start, dyad)],
     }
 
-    return scores, pns_frag_range
+    return scores, pns_frag_range, fragments
 
 
 def find_peaks_and_regions(scores, original_start, min_length=50, max_neg_run=5):
-    """
-    Segment the 1D score array into alternating positive and negative regions, then call peaks.
-
-    Logic:
-    - First, find "positive regions": consecutive scores > 0, allowing brief dips (<= max_neg_run)
-      before closing the region. Regions shorter than min_length are discarded.
-    - Between successive positive regions, find the most negative point => negative peak.
-    - Within each positive region, find the max point => positive peak.
-    - Also define a "region midpoint" peak: midpoint of region boundaries (not max position).
-      (This is stored as adjusted_positive_peaks, used as a PNS peak coordinate.)
-
-    Coordinate handling:
-    - Input 'scores' uses array indices [0..len-1].
-    - This function converts peaks/regions to absolute genome coordinates by adding original_start.
-      (In calling code, original_start is the region's adjusted_start in genome coords.)
-    """
     positive_regions = []
     current_region = None
-    searching_for_positive = True  # start in positive scanning mode
+    searching_for_positive = True
+    neg_count = 0
+    last_positive_end = None
 
     for i in range(len(scores)):
         score = scores[i]
@@ -305,20 +496,17 @@ def find_peaks_and_regions(scores, original_start, min_length=50, max_neg_run=5)
                     current_region[1] = i
                 neg_count = 0
             else:
-                # We were in a positive region but now hit <=0.
-                # Allow up to max_neg_run consecutive non-positive positions before closing.
                 if current_region:
                     neg_count += 1
                     if neg_count == 1:
                         last_positive_end = i - 1
-
                     if neg_count >= max_neg_run:
-                        if last_positive_end - current_region[0] + 1 >= min_length:
+                        if last_positive_end is not None and last_positive_end - current_region[0] + 1 >= min_length:
                             positive_regions.append([current_region[0], last_positive_end])
                         current_region = None
                         searching_for_positive = False
+                        neg_count = 0
         else:
-            # Searching for negative region (we don't store negative regions; just skip until positive resumes)
             if score <= 0:
                 if current_region is None:
                     current_region = [i, i]
@@ -329,42 +517,37 @@ def find_peaks_and_regions(scores, original_start, min_length=50, max_neg_run=5)
                 searching_for_positive = True
                 neg_count = 0
 
-    # If we ended while inside a positive region, add it if long enough
     if current_region:
         if searching_for_positive and current_region[1] - current_region[0] + 1 >= min_length:
             positive_regions.append(current_region)
 
-    # Negative peaks: for each gap between positive regions, take argmin in the inter-region segment
     negative_peaks = []
     negative_peak_scores = []
     for i in range(1, len(positive_regions)):
         prev_end = positive_regions[i - 1][1]
         next_start = positive_regions[i][0]
-        inter_region_scores = scores[prev_end + 1:next_start]
+        inter_region_scores = scores[prev_end + 1 : next_start]
         if len(inter_region_scores) > 0:
             most_negative_index = np.argmin(inter_region_scores) + prev_end + 1
             most_negative_score = scores[most_negative_index]
             negative_peaks.append(most_negative_index)
             negative_peak_scores.append(most_negative_score)
 
-    # Positive peaks: max within each positive region
     positive_peaks = []
     positive_peak_scores = []
     for region in positive_regions:
-        region_scores = scores[region[0]:region[1] + 1]
+        region_scores = scores[region[0] : region[1] + 1]
         peak_index = np.argmax(region_scores) + region[0]
         positive_peaks.append(peak_index)
         positive_peak_scores.append(scores[peak_index])
 
-    # Convert positive regions to absolute genomic coords
-    positive_peak_regions = [(region[0] + original_start, region[1] + original_start)
-                             for region in positive_regions]
+    positive_peak_regions = [
+        (region[0] + original_start, region[1] + original_start) for region in positive_regions
+    ]
+    adjusted_positive_peaks = [
+        (region[0] + region[1]) // 2 + original_start for region in positive_regions
+    ]
 
-    # "Adjusted" peak is region midpoint in absolute coords (stable center-of-region peak)
-    adjusted_positive_peaks = [(region[0] + region[1]) // 2 + original_start
-                               for region in positive_regions]
-
-    # Convert peak indices to absolute coords
     positive_peaks = [p + original_start for p in positive_peaks]
     negative_peaks = [p + original_start for p in negative_peaks]
 
@@ -375,25 +558,18 @@ def find_peaks_and_regions(scores, original_start, min_length=50, max_neg_run=5)
     )
 
 
+# ----------------------------
+# Score-track writers
+# ----------------------------
 def write_bedgraph(scores, contigs, out_prefix, first_region=False):
     """
-    Write a multi-column bedGraph-like file with per-base scores for multiple tracks.
-
-    Output format per line:
-        chrom  start  end  coverage  pns_smoothed  pns  dyad
-    (exact order depends on scores.keys() iteration order)
-
-    Important coordinate note:
-    - scores arrays are relative to the region's adjusted_start.
-    - contigs contains (original_start, original_end) boundaries for the *non-overhang* region.
-      This function only writes positions within [original_start, original_end), trimming overlaps.
+    Legacy: combined bedGraph with multiple tracks as extra columns.
     """
-    mode = 'w' if first_region else 'a'
+    mode = "w" if first_region else "a"
     original_start, original_end = contigs[0]
     filename = f"{out_prefix}_combined_scores.bedGraph"
 
     with open(filename, mode) as f:
-        # Use the first score type to establish (contig, start, length)
         first_score_type = list(scores.keys())[0]
         contig_data = scores[first_score_type]
 
@@ -402,111 +578,154 @@ def write_bedgraph(scores, contigs, out_prefix, first_region=False):
                 contig = f"chr{contig}"
 
             for i in range(len(score_array)):
-                position = start + i  # absolute genome coordinate
+                position = start + i
                 if original_start <= position < original_end:
                     line = [contig, str(position), str(position + 1)]
-
-                    # Append each score type’s value at this position
                     for stype in scores.keys():
                         stype_score_array = scores[stype][0][2]
                         if i < len(stype_score_array):
-                            # Write ints cleanly, floats to 2 decimals
-                            if stype_score_array[i] == int(stype_score_array[i]):
-                                line.append(f"{int(stype_score_array[i])}")
+                            v = stype_score_array[i]
+                            if float(v).is_integer():
+                                line.append(f"{int(v)}")
                             else:
-                                line.append(f"{stype_score_array[i]:.2f}")
+                                line.append(f"{float(v):.6f}")
                         else:
                             line.append("0")
-
                     f.write("\t".join(line) + "\n")
 
 
-def write_nucleosome_peaks(peaks, contigs, out_prefix,
-                          first_region=False, flip_scores=False):
-    """
-    Write called peaks and their nucleosome/breakpoint regions into a BED-like file.
+def _wig_val_to_str(track: str, v) -> str:
+    if track in ("coverage", "dyad"):
+        return str(int(v))
+    return f"{float(v):.6f}"
 
-    Each output row contains:
-    chrom, region_start, region_end,
-    prominence_score,
-    adjusted_peak (midpoint),
-    upstream_score, upstream_peak_pos,
-    downstream_score, downstream_peak_pos,
-    peak_score, peak_pos,
-    max_coverage, max_coverage_pos
 
-    Prominence is computed as:
-        peak_score - mean(upstream_flank_score, downstream_flank_score)
-    where flank scores come from nearest negative peaks on either side.
-    For flipped score calling (breakpoints), we flip sign so "prominence" is still positive-ish.
+def write_wig_gz_tracks(
+    scores: Dict[str, List[Tuple[str, int, np.ndarray]]],
+    contig: str,
+    adjusted_start: int,
+    original_start: int,
+    original_end: int,
+    out_prefix: str,
+    tracks: List[str],
+    first_region: bool,
+):
     """
-    mode = 'w' if first_region else 'a'
+    Write fixedStep WIG, gzipped, one file per track:
+      <out_prefix>_<track>.wig.gz
+
+    WIG fixedStep 'start' is 1-based. We write the core (non-overlap) region only.
+    """
+    if not tracks:
+        return
+
+    chrom = contig if contig.startswith("chr") else f"chr{contig}"
+    core_len = max(0, original_end - original_start)
+    if core_len == 0:
+        return
+
+    for track in tracks:
+        if track not in scores:
+            continue
+
+        path = f"{out_prefix}_{track}.wig.gz"
+        mode = "wt" if first_region else "at"
+
+        arr = scores[track][0][2]  # aligned to adjusted_start
+        # fixedStep start is 1-based coordinate of first value
+        wig_start_1based = original_start + 1
+
+        with gzip.open(path, mode) as f:
+            f.write(f"fixedStep chrom={chrom} start={wig_start_1based} step=1\n")
+            for pos in range(original_start, original_end):
+                i = pos - adjusted_start
+                if 0 <= i < len(arr):
+                    f.write(_wig_val_to_str(track, arr[i]) + "\n")
+                else:
+                    # Should not happen in normal overlap logic, but keep safe:
+                    f.write("0\n")
+
+
+# ----------------------------
+# Peak writers
+# ----------------------------
+def write_bed_rows(rows, path, mode):
+    """
+    BED8 writer (WPS-like), with strand provided by rows.
+    Each row: (chrom, start, end, name, score, strand, thick_start, thick_end)
+    """
+    with open(path, mode) as f:
+        for chrom, start, end, name, score, strand, thick_start, thick_end in rows:
+            f.write(
+                f"{chrom}\t{int(start)}\t{int(end)}\t{name}\t{int(score)}\t{strand}\t{int(thick_start)}\t{int(thick_end)}\n"
+            )
+
+
+def write_nucleosome_peaks_rich(peaks, contigs, out_prefix, first_region=False, flip_scores=False):
+    """
+    Current multi-column (rich) writer. Keeps your original output format.
+    """
+    mode = "w" if first_region else "a"
     original_start, original_end = contigs[0]
 
     nucleosome_filename = f"{out_prefix}.bed"
     with open(nucleosome_filename, mode) as f:
-        for (contig, original_start), peak_data in peaks.items():
+        for (contig, original_start_key), peak_data in peaks.items():
             if not contig.startswith("chr"):
                 contig = f"chr{contig}"
 
-            num_positive_peaks = len(peak_data['adjusted_peaks'])
-            num_negative_peaks = len(peak_data['negative_peaks'])
+            num_positive_peaks = len(peak_data["adjusted_peaks"])
+            num_negative_peaks = len(peak_data["negative_peaks"])
 
             for i in range(num_positive_peaks):
-                adjusted_peak = peak_data['adjusted_peaks'][i]
-                nucleosome_region_start = peak_data['nucleosome_regions'][i][0]
-                nucleosome_region_end = peak_data['nucleosome_regions'][i][1]
-                peak = peak_data['positive_peaks'][i]
+                adjusted_peak = peak_data["adjusted_peaks"][i]
+                nucleosome_region_start = peak_data["nucleosome_regions"][i][0]
+                nucleosome_region_end = peak_data["nucleosome_regions"][i][1]
+                peak = peak_data["positive_peaks"][i]
 
-                # Only write peaks whose max-position lies inside the non-overhang region
                 if not (original_start <= peak < original_end):
                     continue
 
-                # Find closest upstream and downstream negative peaks around this positive peak
                 upstream_index = None
                 downstream_index = None
 
                 for j in range(num_negative_peaks):
-                    if peak_data['negative_peaks'][j] < peak:
+                    if peak_data["negative_peaks"][j] < peak:
                         upstream_index = j
                     else:
                         break
 
                 for j in range(num_negative_peaks):
-                    if peak_data['negative_peaks'][j] > peak:
+                    if peak_data["negative_peaks"][j] > peak:
                         downstream_index = j
                         break
 
-                # If no flanking negative peak exists on a side, fall back to the positive peak
-                # (so prominence becomes 0 on that side)
                 if upstream_index is not None:
-                    upstream_negative_peak = peak_data['negative_peaks'][upstream_index]
-                    upstream_score = peak_data['negative_peak_scores'][upstream_index]
+                    upstream_negative_peak = peak_data["negative_peaks"][upstream_index]
+                    upstream_score = peak_data["negative_peak_scores"][upstream_index]
                 else:
                     upstream_negative_peak = peak
-                    upstream_score = peak_data['positive_peak_scores'][i]
+                    upstream_score = peak_data["positive_peak_scores"][i]
 
                 if downstream_index is not None:
-                    downstream_negative_peak = peak_data['negative_peaks'][downstream_index]
-                    downstream_score = peak_data['negative_peak_scores'][downstream_index]
+                    downstream_negative_peak = peak_data["negative_peaks"][downstream_index]
+                    downstream_score = peak_data["negative_peak_scores"][downstream_index]
                 else:
                     downstream_negative_peak = peak
-                    downstream_score = peak_data['positive_peak_scores'][i]
+                    downstream_score = peak_data["positive_peak_scores"][i]
 
-                # For the "breakpoint" call track, scores were negated to turn troughs into peaks.
-                # flip_scores flips sign back for reporting so trough depth is represented consistently.
                 if flip_scores:
                     upstream_score *= -1
                     downstream_score *= -1
-                    peak_score = -1 * peak_data['positive_peak_scores'][i]
+                    peak_score = -1 * peak_data["positive_peak_scores"][i]
                 else:
-                    peak_score = peak_data['positive_peak_scores'][i]
+                    peak_score = peak_data["positive_peak_scores"][i]
 
                 average_flanking_score = np.mean([upstream_score, downstream_score])
                 prominence_score = peak_score - average_flanking_score
 
-                max_coverage = peak_data['max_coverages'][i]
-                max_position = peak_data['max_positions'][i]
+                max_coverage = peak_data["max_coverages"][i]
+                max_position = peak_data["max_positions"][i]
 
                 f.write(
                     f"{contig}\t{nucleosome_region_start}\t{nucleosome_region_end}\t"
@@ -518,15 +737,86 @@ def write_nucleosome_peaks(peaks, contigs, out_prefix,
                 )
 
 
-def split_into_regions(contig, start, end, contig_len, max_length=100000, overlap=1000):
+def peaks_to_bed8_rows(
+    peaks: dict,
+    original_start: int,
+    original_end: int,
+    label: str,
+    flip_scores: bool,
+    score_scale: float,
+) -> List[Tuple[str, int, int, str, int, str, int, int]]:
     """
-    Split [start,end) into chunks of size max_length, but score each chunk on an
-    expanded window [adjusted_start, adjusted_end) that includes 'overlap' padding
-    on both sides, clipped only to chromosome bounds.
+    Convert internal peak dict to BED8 rows (WPS-like), with strand='.'.
 
-    Returns tuples:
-      (contig, adjusted_start, adjusted_end, original_start, original_end)
+    We use:
+      chrom, region_start, region_end
+      name = f"{chrom}:{peak}_{label}"
+      score = round(prominence * score_scale) as int
+      strand = '.'
+      thickStart/thickEnd = peak/peak+1 (peak coordinate highlighted)
     """
+    rows = []
+
+    for (contig, _orig_start_key), peak_data in peaks.items():
+        chrom = contig if contig.startswith("chr") else f"chr{contig}"
+
+        num_positive_peaks = len(peak_data["adjusted_peaks"])
+        num_negative_peaks = len(peak_data["negative_peaks"])
+
+        for i in range(num_positive_peaks):
+            region_start = peak_data["nucleosome_regions"][i][0]
+            region_end = peak_data["nucleosome_regions"][i][1]
+            peak = peak_data["positive_peaks"][i]
+
+            # Keep only peaks whose PEAK lies in the core region
+            if not (original_start <= peak < original_end):
+                continue
+
+            # Find flanking negative peaks (by position)
+            upstream_index = None
+            downstream_index = None
+
+            for j in range(num_negative_peaks):
+                if peak_data["negative_peaks"][j] < peak:
+                    upstream_index = j
+                else:
+                    break
+
+            for j in range(num_negative_peaks):
+                if peak_data["negative_peaks"][j] > peak:
+                    downstream_index = j
+                    break
+
+            if upstream_index is not None:
+                upstream_score = peak_data["negative_peak_scores"][upstream_index]
+            else:
+                upstream_score = peak_data["positive_peak_scores"][i]
+
+            if downstream_index is not None:
+                downstream_score = peak_data["negative_peak_scores"][downstream_index]
+            else:
+                downstream_score = peak_data["positive_peak_scores"][i]
+
+            peak_score = peak_data["positive_peak_scores"][i]
+            if flip_scores:
+                upstream_score *= -1
+                downstream_score *= -1
+                peak_score *= -1
+
+            prominence = float(peak_score) - float(np.mean([upstream_score, downstream_score]))
+            score_int = int(round(prominence * score_scale))
+
+            name = f"{chrom}:{peak}_{label}"
+            strand = "."
+            thick_start = int(peak)
+            thick_end = int(peak) + 1
+
+            rows.append((chrom, int(region_start), int(region_end), name, score_int, strand, thick_start, thick_end))
+
+    return rows
+
+
+def split_into_regions(contig, start, end, contig_len, max_length=100000, overlap=1000):
     regions = []
     current_start = start
 
@@ -546,7 +836,7 @@ def split_into_regions(contig, start, end, contig_len, max_length=100000, overla
 def call_and_write_peaks(
     scores,
     coverage_scores,
-    adjusted_start,   # array index 0 corresponds to this absolute coordinate
+    adjusted_start,
     original_start,
     original_end,
     contig,
@@ -554,41 +844,27 @@ def call_and_write_peaks(
     first_region,
     peak_type_label,
     flip_scores,
+    peak_format: str,
+    peak_score_scale: float,
 ):
-    """
-    Peak calling + output writing wrapper for one score track over one window.
-
-    Inputs:
-    - scores: 1D numpy array for the window (relative to adjusted_start)
-    - coverage_scores: 1D int array matching scores length (relative to adjusted_start)
-    - adjusted_start: absolute coordinate of index 0 in these arrays
-    - original_start/original_end: boundaries of the non-overlap part of this window
-
-    Process:
-    1) Call positive regions/peaks and inter-region negative peaks via find_peaks_and_regions().
-       That function returns absolute genomic coordinates (because we pass adjusted_start).
-    2) For each called region, compute max coverage and its position within the region.
-    3) Write peaks/regions to output BED-like file (append after first region).
-    """
-    positive_peaks, negative_peaks, adjusted_peaks = find_peaks_and_regions(scores, adjusted_start, 50, 5)
+    positive_peaks, negative_peaks, adjusted_peaks = find_peaks_and_regions(
+        scores, adjusted_start, 50, 5
+    )
 
     max_coverages = []
     max_positions = []
     arr_len = coverage_scores.shape[0]
 
-    # adjusted_peaks[1] contains region intervals in absolute coords (start,end)
-    for start, end in adjusted_peaks[1]:
-        # Convert absolute coords back to window-relative indices
-        region_start_idx = max(0, start - adjusted_start)
-        region_end_idx = min(arr_len - 1, end - adjusted_start)
+    for start_abs, end_abs in adjusted_peaks[1]:
+        region_start_idx = max(0, start_abs - adjusted_start)
+        region_end_idx = min(arr_len - 1, end_abs - adjusted_start)
 
         if region_end_idx < region_start_idx:
             max_coverages.append(0)
             max_positions.append(0)
             continue
 
-        # Slice is inclusive, so add 1 to end index
-        region_coverage = coverage_scores[region_start_idx:region_end_idx + 1]
+        region_coverage = coverage_scores[region_start_idx : region_end_idx + 1]
 
         if region_coverage.size > 0:
             local_argmax = int(np.argmax(region_coverage))
@@ -600,57 +876,63 @@ def call_and_write_peaks(
 
     peaks = {
         (contig, original_start): {
-            'positive_peaks': positive_peaks[0],
-            'positive_peak_scores': positive_peaks[1],
-            'negative_peaks': negative_peaks[0],
-            'negative_peak_scores': negative_peaks[1],
-            'adjusted_peaks': adjusted_peaks[0],
-            'nucleosome_regions': adjusted_peaks[1],
-            'max_coverages': max_coverages,
-            'max_positions': max_positions,
+            "positive_peaks": positive_peaks[0],
+            "positive_peak_scores": positive_peaks[1],
+            "negative_peaks": negative_peaks[0],
+            "negative_peak_scores": negative_peaks[1],
+            "adjusted_peaks": adjusted_peaks[0],
+            "nucleosome_regions": adjusted_peaks[1],
+            "max_coverages": max_coverages,
+            "max_positions": max_positions,
         }
     }
 
-    write_nucleosome_peaks(
-        peaks,
-        [(original_start, original_end)],
-        out_prefix + peak_type_label,
-        first_region,
-        flip_scores,
-    )
+    # --- Write in requested peak format ---
+    if peak_format == "rich":
+        write_nucleosome_peaks_rich(
+            peaks,
+            [(original_start, original_end)],
+            out_prefix + peak_type_label,
+            first_region,
+            flip_scores,
+        )
+    elif peak_format == "bed8":
+        mode = "w" if first_region else "a"
+        out_path = f"{out_prefix}{peak_type_label}.bed"
+
+        label = "nuc" if not flip_scores else "brk"
+        rows = peaks_to_bed8_rows(
+            peaks=peaks,
+            original_start=original_start,
+            original_end=original_end,
+            label=label,
+            flip_scores=flip_scores,
+            score_scale=peak_score_scale,
+        )
+        write_bed_rows(rows, out_path, mode=mode)
+    else:
+        raise ValueError(f"Unknown peak_format: {peak_format}")
 
 
 def require_bam_indexes(bam_paths, parser=None):
-    """
-    Ensure each BAM has an accompanying BAI index in the same directory.
-    Exits with an error if any index is missing.
-
-    Accepts either:
-      - <bam>.bai
-      - <bam_basename>.bai   (e.g. sample.bai for sample.bam)
-
-    Args:
-        bam_paths (list[str]): BAM file paths.
-        parser (argparse.ArgumentParser | None): If provided, uses parser.error()
-            for consistent CLI error formatting; otherwise raises FileNotFoundError.
-    """
     missing = []
 
     for bam in bam_paths:
         bam = os.path.abspath(bam)
         bam_dir = os.path.dirname(bam)
 
-        # Two common index naming conventions
-        idx1 = bam + ".bai"  # e.g. sample.bam.bai
-        idx2 = os.path.join(bam_dir, os.path.splitext(os.path.basename(bam))[0] + ".bai")  # e.g. sample.bai
+        idx1 = bam + ".bai"
+        idx2 = os.path.join(bam_dir, os.path.splitext(os.path.basename(bam))[0] + ".bai")
 
         if not (os.path.exists(idx1) or os.path.exists(idx2)):
             missing.append((bam, idx1, idx2))
 
     if missing:
-        msg_lines = ["ERROR: Missing BAM index (.bai) for the following BAM file(s).",
-                     "Each BAM input must have its .bai index in the SAME directory as the BAM:",
-                     ""]
+        msg_lines = [
+            "ERROR: Missing BAM index (.bai) for the following BAM file(s).",
+            "Each BAM input must have its .bai index in the SAME directory as the BAM:",
+            "",
+        ]
         for bam, idx1, idx2 in missing:
             msg_lines.append(f"  BAM: {bam}")
             msg_lines.append(f"    expected: {idx1}")
@@ -666,26 +948,125 @@ def require_bam_indexes(bam_paths, parser=None):
             raise FileNotFoundError(msg)
 
 
+def write_fragment_outputs(
+    out_prefix: str,
+    total_fragments_filtered_all: int,
+    total_fragments_used_in_range: int,
+    unique_bases_covered_by_used: int,
+    length_counts: Counter,
+):
+    summary_path = f"{out_prefix}_fragment_summary.txt"
+    lens_path = f"{out_prefix}_fragment_length_counts.tsv"
+
+    with open(summary_path, "w") as f:
+        f.write(f"total_fragments_filtered_all\t{total_fragments_filtered_all}\n")
+        f.write(f"total_fragments_used_in_range\t{total_fragments_used_in_range}\n")
+        f.write(f"unique_bases_covered_by_used_fragments\t{unique_bases_covered_by_used}\n")
+
+    with open(lens_path, "w") as f:
+        f.write("fragment_length\tcount\n")
+        for L in sorted(length_counts.keys()):
+            f.write(f"{int(L)}\t{int(length_counts[L])}\n")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Score fragmentomics data.")
-    parser.add_argument('-b', '--bamfiles', nargs='+', help='BAM file(s) to process')
-    parser.add_argument('-o', '--out_prefix', help='prefix for output files (default: based on BAM names and contigs)')
-    parser.add_argument('-c', '--contigs', nargs='+',
-                        help='limit to contig(s) and optional range, e.g. "2:100000-200000"')
-    parser.add_argument('--mode-length', type=int, default=167, help='Mode fragment length (used in kernel geometry)')
-    parser.add_argument('--frag-lower', type=int, default=127, help='Lower fragment length to include')
-    parser.add_argument('--frag-upper', type=int, default=207, help='Upper fragment length to include')
-    parser.add_argument('--max-duplicates', type=int, default=0, help='Max allowed duplicate fragments with same coords')
-    parser.add_argument('--chunk-bp', type=int, default=100000, help='Chunk size for windowing')
-    parser.add_argument('--overlap-bp', type=int, default=1000, help='Overlap padding on each side of chunk')
-    parser.add_argument('--subsample', type=float, default=None,
-        help='Subsampling proportion (e.g., 0.5 to subsample 50%% of the reads)')
+    parser.add_argument("-b", "--bamfiles", nargs="+", required=True, help="BAM file(s) to process")
+    parser.add_argument("-o", "--out_prefix", help="prefix for output files (default: based on BAM names and contigs)")
+    parser.add_argument("-c", "--contigs", nargs="+", help='limit to contig(s) and optional range, e.g. "2:100000-200000"')
+    parser.add_argument("--mode-length", type=int, default=167, help="Mode fragment length (used in kernel geometry)")
+    parser.add_argument("--frag-lower", type=int, default=127, help="Lower fragment length to include")
+    parser.add_argument("--frag-upper", type=int, default=207, help="Upper fragment length to include")
+    parser.add_argument("--max-duplicates", type=int, default=0, help="Max allowed duplicate fragments with same coords")
+    parser.add_argument("--chunk-bp", type=int, default=100000, help="Chunk size for windowing")
+    parser.add_argument("--overlap-bp", type=int, default=1000, help="Overlap padding on each side of chunk")
+    parser.add_argument("--subsample", type=float, default=None, help="Subsampling proportion (e.g., 0.5 to subsample 50%% of the reads)")
+    parser.add_argument("--seed", type=int, default=None, help="Random seed (for reproducibility)")
+
+    # Randomization controls
+    parser.add_argument(
+        "--randomize-mode",
+        choices=["none", "uniform", "dinuc_anchor"],
+        default="none",
+        help="Fragment randomization mode within each processed window.",
+    )
+    parser.add_argument(
+        "--fasta",
+        default=None,
+        help="Reference FASTA (required for --randomize-mode dinuc_anchor). Needs .fai index.",
+    )
+    parser.add_argument(
+        "--anchor-prob-start",
+        type=float,
+        default=0.5,
+        help="For dinuc_anchor: probability of anchoring on fragment START (otherwise anchor on END).",
+    )
+    parser.add_argument(
+        "--max-anchor-tries",
+        type=int,
+        default=30,
+        help="For dinuc_anchor: max attempts to find a valid placement per fragment.",
+    )
+    parser.add_argument(
+        "--randomize-fallback",
+        choices=["uniform", "keep", "skip"],
+        default="uniform",
+        help="For dinuc_anchor: what to do if no valid dinuc placement is found.",
+    )
+
+    # Score-track output controls
+    parser.add_argument(
+        "--score-format",
+        choices=["bedgraph", "wiggz", "both", "none"],
+        default="wiggz",
+        help="How to write per-base score tracks. 'wiggz' writes one <prefix>_<track>.wig.gz per track.",
+    )
+    parser.add_argument(
+        "--score-tracks",
+        nargs="*",
+        default=["coverage", "pns_smoothed", "pns", "dyad"],
+        help=(
+            "Which score tracks to output (space-separated). "
+            "Valid: coverage pns_smoothed pns dyad. "
+            "Use '--score-tracks none' or '--score-format none' to disable."
+        ),
+    )
+
+    # Peak output controls
+    parser.add_argument(
+        "--peak-format",
+        choices=["rich", "bed8"],
+        default="bed8",
+        help="Peak BED8 output format.",
+    )
+    parser.add_argument(
+        "--peak-score-scale",
+        type=float,
+        default=1.0,
+        help="Only for --peak-format bed8: score = round(prominence * scale) written as int.",
+    )
 
     args = parser.parse_args()
 
+    # Normalize --score-tracks none
+    valid_tracks = {"coverage", "pns_smoothed", "pns", "dyad"}
+    if args.score_tracks and len(args.score_tracks) == 1 and args.score_tracks[0].lower() == "none":
+        args.score_tracks = []
+    else:
+        bad = [t for t in args.score_tracks if t not in valid_tracks]
+        if bad:
+            parser.error(f"Unknown --score-tracks: {bad}. Valid: {sorted(valid_tracks)}")
+
+    if args.seed is not None:
+        random.seed(args.seed)
+        np.random.seed(args.seed)
+
     require_bam_indexes(args.bamfiles, parser=parser)
 
-    # Default output prefix: join BAM basenames, optionally append contig if single contig
+    if args.randomize_mode == "dinuc_anchor" and not args.fasta:
+        parser.error("--randomize-mode dinuc_anchor requires --fasta <ref.fa> (with .fai index).")
+
+    # Default output prefix
     if not args.out_prefix:
         bam_basenames = [os.path.splitext(os.path.basename(bam))[0] for bam in args.bamfiles]
         args.out_prefix = f"{'_'.join(bam_basenames)}"
@@ -693,7 +1074,6 @@ def main():
             safe_contig = args.contigs[0].replace(":", "_")
             args.out_prefix = f"{args.out_prefix}_{safe_contig}"
 
-    # Add mode and frag range to make outputs self-describing
     args.out_prefix = f"{args.out_prefix}_mode{args.mode_length}_lower{args.frag_lower}_upper{args.frag_upper}"
 
     # Open BAMs
@@ -704,79 +1084,148 @@ def main():
             bamfiles.append(bamfile)
         except FileNotFoundError:
             parser.error(f"Unable to open bamfile {bamfile_path} (file not found)")
-            return -1
+            return 2
         except Exception as e:
             parser.error(f"Unable to open bamfile {bamfile_path}: {str(e)}")
-            return -1
+            return 2
 
-    # Build list of regions to process:
-    # - If user provides contigs with ranges: split into 100kb windows with overlaps
-    # - If user provides contigs without ranges: whole contig split into windows
-    # - If nothing provided: process all references in BAM[0]
+    # Open FASTA if needed
+    fasta = None
+    if args.fasta:
+        try:
+            fasta = pysam.FastaFile(args.fasta)
+        except Exception as e:
+            parser.error(f"Unable to open FASTA '{args.fasta}': {str(e)}")
+            return 2
+
+    # Build list of regions to process
     contigs = []
     if args.contigs:
         for contig_range in args.contigs:
-            if ':' in contig_range:
-                contig, positions = contig_range.split(':')
-                start, end = map(int, positions.split('-'))
+            if ":" in contig_range:
+                contig, positions = contig_range.split(":")
+                start, end = map(int, positions.split("-"))
                 contig_len = bamfiles[0].get_reference_length(contig)
-                contigs.extend(split_into_regions(
-                    contig, start, end, contig_len,
-                    max_length=args.chunk_bp,
-                    overlap=args.overlap_bp
-                ))
+                contigs.extend(
+                    split_into_regions(
+                        contig, start, end, contig_len,
+                        max_length=args.chunk_bp,
+                        overlap=args.overlap_bp
+                    )
+                )
             else:
                 contig = contig_range
                 start, end = 0, bamfiles[0].get_reference_length(contig)
                 contig_len = bamfiles[0].get_reference_length(contig)
-                contigs.extend(split_into_regions(
-                    contig, start, end, contig_len,
-                    max_length=args.chunk_bp,
-                    overlap=args.overlap_bp
-                ))
+                contigs.extend(
+                    split_into_regions(
+                        contig, start, end, contig_len,
+                        max_length=args.chunk_bp,
+                        overlap=args.overlap_bp
+                    )
+                )
     else:
         for contig in bamfiles[0].references:
             start, end = 0, bamfiles[0].get_reference_length(contig)
             contig_len = bamfiles[0].get_reference_length(contig)
-            contigs.extend(split_into_regions(
-                contig, start, end, contig_len,
-                max_length=args.chunk_bp,
-                overlap=args.overlap_bp
-            ))
+            contigs.extend(
+                split_into_regions(
+                    contig, start, end, contig_len,
+                    max_length=args.chunk_bp,
+                    overlap=args.overlap_bp
+                )
+            )
 
-    # Precompute scoring kernels for each fragment length in [frag_lower, frag_upper]
+    # Precompute kernels
     pns_frag_range = range(args.frag_lower, args.frag_upper + 1)
     distributions = precompute_distributions(pns_frag_range, args.mode_length)
 
-    # Remove old outputs (append mode is used across windows)
+    # Remove old outputs
     combined_bedgraph = f"{args.out_prefix}_combined_scores.bedGraph"
-    nucleosome_bed = f"{args.out_prefix}_nucleosome_regions.bed"
-    breakpoint_bed = f"{args.out_prefix}_breakpoint_peaks.bed"
-    for fname in [combined_bedgraph, nucleosome_bed, breakpoint_bed]:
+    nucleosome_bed_rich = f"{args.out_prefix}_nucleosome_regions.bed"
+    breakpoint_bed_rich = f"{args.out_prefix}_breakpoint_peaks.bed"
+    nucleosome_bed8 = f"{args.out_prefix}_nucleosome_regions.bed"
+    breakpoint_bed8 = f"{args.out_prefix}_breakpoint_peaks.bed"
+    frag_summary = f"{args.out_prefix}_fragment_summary.txt"
+    frag_lens = f"{args.out_prefix}_fragment_length_counts.tsv"
+
+    # Track outputs
+    wig_paths = [f"{args.out_prefix}_{t}.wig.gz" for t in args.score_tracks]
+
+    to_remove = [frag_summary, frag_lens]
+    if args.score_format in ("bedgraph", "both"):
+        to_remove.append(combined_bedgraph)
+
+    # Peak outputs depend on format
+    if args.peak_format == "rich":
+        to_remove.extend([nucleosome_bed_rich, breakpoint_bed_rich])
+    else:
+        to_remove.extend([nucleosome_bed8, breakpoint_bed8])
+
+    if args.score_format in ("wiggz", "both"):
+        to_remove.extend(wig_paths)
+
+    for fname in to_remove:
         if os.path.exists(fname):
             os.remove(fname)
 
-    first_region = True
-    for contig, adjusted_start, adjusted_end, original_start, original_end in tqdm(contigs, desc='Scoring contigs'):
+    # Global fragment accounting
+    total_fragments_filtered_all = 0          # all filtered fragments that "belong" to a chunk
+    total_fragments_used_in_range = 0         # within [frag-lower, frag-upper] and belong to a chunk
+    unique_bases_covered_by_used = 0          # unique bases covered within original (non-overlap) spans
+    length_counts = Counter()                 # length histogram for used fragments only
 
-        # Compute tracks on the overlapped window [adjusted_start, adjusted_end)
-        scores, pns_frag_range = score_contig(
-            bamfiles,
-            contig,
-            adjusted_start,
-            adjusted_end,
-            args.mode_length,
-            pns_frag_range,
-            args.max_duplicates,
-            distributions,
-            args.subsample
+    first_region = True
+    for contig, adjusted_start, adjusted_end, original_start, original_end in tqdm(contigs, desc="Scoring contigs"):
+        scores, pns_frag_range, fragments_filtered = score_contig(
+            bamfiles=bamfiles,
+            contig=contig,
+            start=adjusted_start,
+            end=adjusted_end,
+            mode_DNA_length=args.mode_length,
+            pns_frag_range=pns_frag_range,
+            max_duplicates=args.max_duplicates,
+            distributions=distributions,
+            subsample=args.subsample,
+            randomize_mode=args.randomize_mode,
+            fasta=fasta,
+            anchor_prob_start=args.anchor_prob_start,
+            max_anchor_tries=args.max_anchor_tries,
+            randomize_fallback=args.randomize_fallback,
         )
 
-        # Extract arrays (relative to adjusted_start)
-        pns_smoothed_scores = scores['pns_smoothed'][0][2]
-        coverage_scores = scores['coverage'][0][2]
+        # ---- Assign fragments to chunk by START in ORIGINAL window ----
+        owned_fragments = []
+        for frag_start, frag_end in fragments_filtered:
+            if original_start <= frag_start < original_end:
+                owned_fragments.append((frag_start, frag_end))
 
-        # Call positive peaks => nucleosome regions
+        total_fragments_filtered_all += len(owned_fragments)
+
+        # Count used fragment lengths + unique bases covered in ORIGINAL region only
+        if original_end > original_start:
+            covered = np.zeros(original_end - original_start, dtype=bool)
+
+            for frag_start, frag_end in owned_fragments:
+                L = frag_end - frag_start
+                if L not in pns_frag_range:
+                    continue
+
+                total_fragments_used_in_range += 1
+                length_counts[L] += 1
+
+                ov_start = max(frag_start, original_start)
+                ov_end = min(frag_end, original_end)
+                if ov_end > ov_start:
+                    covered[ov_start - original_start : ov_end - original_start] = True
+
+            unique_bases_covered_by_used += int(covered.sum())
+        # -------------------------------------------------------------------------------
+
+        pns_smoothed_scores = scores["pns_smoothed"][0][2]
+        coverage_scores = scores["coverage"][0][2]
+
+        # Nucleosome regions
         call_and_write_peaks(
             scores=pns_smoothed_scores,
             coverage_scores=coverage_scores,
@@ -788,9 +1237,11 @@ def main():
             first_region=first_region,
             peak_type_label="_nucleosome_regions",
             flip_scores=False,
+            peak_format=args.peak_format,
+            peak_score_scale=args.peak_score_scale,
         )
 
-        # Call negative peaks by flipping sign => breakpoint peaks
+        # Breakpoint peaks (flip sign)
         flipped_scores = -1 * pns_smoothed_scores
         call_and_write_peaks(
             scores=flipped_scores,
@@ -803,15 +1254,51 @@ def main():
             first_region=first_region,
             peak_type_label="_breakpoint_peaks",
             flip_scores=True,
+            peak_format=args.peak_format,
+            peak_score_scale=args.peak_score_scale,
         )
 
-        # Write per-base scores, trimmed to the non-overlap region
-        write_bedgraph(scores, [(original_start, original_end)], args.out_prefix, first_region)
+        # Per-base scores, trimmed to non-overlap region
+        if args.score_format in ("bedgraph", "both"):
+            write_bedgraph(scores, [(original_start, original_end)], args.out_prefix, first_region)
+
+        if args.score_format in ("wiggz", "both") and args.score_tracks:
+            write_wig_gz_tracks(
+                scores=scores,
+                contig=contig,
+                adjusted_start=adjusted_start,
+                original_start=original_start,
+                original_end=original_end,
+                out_prefix=args.out_prefix,
+                tracks=args.score_tracks,
+                first_region=first_region,
+            )
 
         first_region = False
+
+    write_fragment_outputs(
+        out_prefix=args.out_prefix,
+        total_fragments_filtered_all=total_fragments_filtered_all,
+        total_fragments_used_in_range=total_fragments_used_in_range,
+        unique_bases_covered_by_used=unique_bases_covered_by_used,
+        length_counts=length_counts,
+    )
+
+    # Close files
+    for b in bamfiles:
+        try:
+            b.close()
+        except Exception:
+            pass
+
+    if fasta is not None:
+        try:
+            fasta.close()
+        except Exception:
+            pass
 
     return 0
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     sys.exit(main())
