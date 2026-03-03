@@ -15,7 +15,7 @@ Shared helpers imported from PNS
   - require_bam_indexes
   - split_into_regions
   - write_bedgraph
-  - write_wig_gz_tracks   (NEW: if present in updated PNS)
+  - write_wig_gz_tracks
   - generate_paired_reads
   - generate_fragment_ranges
 
@@ -222,8 +222,8 @@ def score_contig(
 ):
     """
     Compute tracks over [start,end):
-      - coverage: TRUE fragment overlap
-      - dyad: TRUE fragment midpoint
+      - coverage: fragment overlap
+      - dyad: fragment midpoint
       - wps: Kircher-equivalent kernel sum
       - wps_smoothed: Savitzky–Golay on raw wps
       - mWPS: wps - rolling median of raw wps
@@ -429,7 +429,6 @@ def evaluate_values_kircher(
             score_int = int(round(float(cval)))
             thick_start = cmiddle - 1
             thick_end = cmiddle
-            # BED8, strand now '.' (not '+')
             calls.append((chrom_out, bed_start, bed_end, name, score_int, ".", thick_start, thick_end))
         return calls
 
@@ -449,7 +448,6 @@ def evaluate_values_kircher(
                     score_int = int(round(float(cval)))
                     thick_start = cmiddle - 1
                     thick_end = cmiddle
-                    # BED8, strand now '.' (not '+')
                     calls.append((chrom_out, bed_start, bed_end, name, score_int, ".", thick_start, thick_end))
         return calls
 
