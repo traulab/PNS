@@ -582,7 +582,7 @@ def main():
     parser.add_argument(
         "--score-format",
         choices=["bedgraph", "wiggz", "both", "none"],
-        default="bedgraph",
+        default="wiggz",
         help="How to write per-base score tracks. 'wiggz' writes one <prefix>_<track>.wig.gz per track.",
     )
     parser.add_argument(
