@@ -123,8 +123,6 @@ dinuc_anchor_randomize_fragments = _pns.dinuc_anchor_randomize_fragments
 require_bam_indexes = _pns.require_bam_indexes
 split_into_regions = _pns.split_into_regions
 write_bedgraph = _pns.write_bedgraph
-
-# NEW: wig.gz writer (added in updated PNS)
 write_wig_gz_tracks = getattr(_pns, "write_wig_gz_tracks", None)
 
 # shared fragment extraction / filtering
@@ -578,7 +576,7 @@ def main():
     parser.add_argument("--sg-window", type=int, default=21, help="Savitzky-Golay window (odd)")
     parser.add_argument("--sg-order", type=int, default=2, help="Savitzky-Golay polynomial order")
 
-    # Score-track output controls (NEW)
+    # Score-track output controls
     parser.add_argument(
         "--score-format",
         choices=["bedgraph", "wiggz", "both", "none"],
