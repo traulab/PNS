@@ -1,31 +1,35 @@
 # WPS with Nucleosome + Breakpoint Peak Calling (Kircher-style)
 
-Tools for generating **WPS (Windowed Protection Score)** tracks from paired-end BAM files, applying **rolling-median baseline correction**, optional **Savitzky–Golay smoothing**, and calling:
+This script generates **Kircher-style WPS (Windowed Protection Score)** tracks from paired-end BAM files, applies **rolling-median baseline correction**, optional **Savitzky–Golay smoothing**, and calls:
 
 - **Positive peaks** → **nucleosome regions**
 - **Negative peaks (troughs)** → **breakpoint peaks** (called by flipping the sign and re-using the same peak caller)
 
-This implementation is designed to match **Martin Kircher’s 2015 WPS behavior** as closely as possible while operating on standard BAM inputs (0-based, half-open coordinates via `pysam`).
+It is designed to match **Martin Kircher’s 2015 WPS behavior** as closely as possible while operating on standard BAM inputs (0-based, half-open coordinates via `pysam`).
+
+**Important implementation detail:** this WPS script **imports shared helper functions** from `PNS_with_nucleosome_peak_calling.py` (expected somewhere under the WPS script directory or its parent directory).
 
 ---
 
-## Table of Contents
+## Table of contents
 
 - [Overview](#overview)
 - [Requirements](#requirements)
-- [Concept: WPS scoring](#concept-wps-scoring)
+- [How this implementation matches Kircher WPS](#how-this-implementation-matches-kircher-wps)
   - [Kircher-style overlap semantics](#kircher-style-overlap-semantics)
   - [Fragment size filtering](#fragment-size-filtering)
+- [Tracks produced](#tracks-produced)
 - [Baseline correction and smoothing](#baseline-correction-and-smoothing)
-- [Peak calling (Kircher-style)](#peak-calling-kircher-style)
+- [Peak calling (Kircher-matched)](#peak-calling-kircher-matched)
+- [Fragment randomization modes](#fragment-randomization-modes)
 - [Script usage](#script-usage)
   - [Basic examples](#basic-examples)
   - [Arguments](#arguments)
   - [How contigs / regions are processed](#how-contigs--regions-are-processed)
 - [Outputs](#outputs)
-  - [1) Combined per-base scores bedGraph](#1-combined-per-base-scores-bedgraph)
-  - [2) Nucleosome regions (positive peaks)](#2-nucleosome-regions-positive-peaks)
-  - [3) Breakpoint peaks (negative peaks)](#3-breakpoint-peaks-negative-peaks)
+  - [Score tracks](#score-tracks)
+  - [Peak calls](#peak-calls)
+  - [Fragment summaries](#fragment-summaries)
 - [Converting to bigWig / bigBed](#converting-to-bigwig--bigbed)
 - [Conda / Mamba environment setup](#conda--mamba-environment-setup)
 - [Notes / gotchas](#notes--gotchas)
@@ -34,119 +38,144 @@ This implementation is designed to match **Martin Kircher’s 2015 WPS behavior*
 
 ## Overview
 
-Pipeline (high level):
+High-level pipeline:
 
 1. Reads **paired-end fragments** from one or more BAM files across contigs or user-specified regions.
-2. Filters read-pairs:
-   - unmapped/mate-unmapped removed
-   - same-strand pairs removed
-   - duplicate/qcfail removed
-   - soft/hard-clipped or padded CIGAR removed
-3. Collapses duplicate fragments by coordinate tuple `(chrom, frag_start, frag_end)` to `--max-duplicates`.
-4. Optionally subsamples fragments (`--subsample`).
-5. For each fragment whose length is within `[--frag-lower, --frag-upper]`:
-   - Adds a **Kircher-equivalent WPS kernel** across the fragment footprint.
-   - Builds a **coverage** track (+1 for each covered base).
-   - Builds a **dyad** track (+1 at fragment center).
-6. Computes **rolling-median baseline** (default 1000 bp) and subtracts it.
-7. Optionally smooths WPS / baselined WPS (Savitzky–Golay; default 21/2).
-8. Calls peaks/regions on the **baselined, smoothed** track:
-   - **positive runs** → nucleosome regions
-   - **negative troughs** (via sign flip) → breakpoint peaks
-9. Writes:
-   - `*_combined_scores.bedGraph` (multi-column per-base track)
-   - `*_nucleosome_regions.bed` (Kircher-style BED8 calls)
-   - `*_breakpoint_peaks.bed` (Kircher-style BED8 calls)
+2. Fragment extraction / filtering is performed by shared functions imported from **PNS** (`generate_paired_reads`, `generate_fragment_ranges`, duplicate handling, etc.).
+3. Optionally randomizes fragment positions (see [Fragment randomization modes](#fragment-randomization-modes)).
+4. For each fragment:
+   - Updates **coverage** track (+1 for each covered base).
+   - Updates **dyad** track (+1 at fragment midpoint).
+   - If the fragment length is within `[--frag-lower, --frag-upper]`, adds a **Kircher-matched WPS kernel** to the WPS track.
+5. Computes a **rolling-median baseline** (default 1000 bp) on the **raw WPS** track and subtracts it.
+6. Optionally smooths **raw WPS** via Savitzky–Golay (default window/order 21/2).
+7. Builds:
+   - `mWPS = wps - rolling_median(wps)`
+   - `sm_mWPS = wps_smoothed - rolling_median(wps)`
+8. Calls peaks on **`sm_mWPS`**:
+   - Positive runs → nucleosome calls
+   - Negative runs (by sign flip) → breakpoint calls
+9. Writes score tracks (bedGraph and/or `.wig.gz`) plus peak calls and fragment summaries.
 
 ---
 
 ## Requirements
 
 ### Python
-- Python 3
+- Python 3 (modern 3.x)
 
-### Required Python libraries
+### Python libraries
 - `numpy`
 - `scipy`
 - `pysam`
 - `tqdm`
 
-### Additional tools (optional but recommended)
-- `samtools` (inspect BAMs, indexing)
-- UCSC tools:
+### External tools (optional but recommended)
+- `samtools` (indexing / inspection)
+- UCSC tools (for visualization-friendly formats):
   - `bedGraphToBigWig`
-  - `bedToBigBed` *(for peak call tracks)*
+  - `bedToBigBed`
 
 ---
 
-## Concept: WPS scoring
-
-Windowed Protection Score (WPS) is a fragmentomics signal intended to quantify **nucleosome protection**:
-
-- For each genome position, define a symmetric protection window (e.g. 120 bp).
-- Fragments that fully span the window contribute positively.
-- Fragments that truncate within the window contribute negatively.
-
-This script implements WPS **via a per-fragment kernel sum**, which is computationally efficient and reproduces Kircher’s effective overlap semantics.
+## How this implementation matches Kircher WPS
 
 ### Kircher-style overlap semantics
 
-Kircher’s original implementation uses bx-python interval logic, which behaves like **half-open intervals**.
-When combined with his 1-based inclusive read coordinates, the effective behavior is:
+Kircher’s original implementation uses bx-python interval logic and 1-based coordinate handling that leads to subtle off-by-one effects in how “spanning the protection window” is evaluated.
 
-- protection window length behaves like `2*half` (e.g. 120 bp), not 121 bp
-- effective fragment is 1 bp shorter on the right for span/truncate classification
+This script reproduces that behavior by adding a **precomputed per-fragment kernel** whose effective length and placement match Kircher’s bx semantics:
 
-This script reproduces that behavior by precomputing a **Kircher-exact kernel** for each fragment length.
+- For protection window `--protection 120`, half-window is `60`.
+- The WPS kernel is placed at `kernel_start = frag_start - half + 1` (genome coordinates).
+- Each allowed fragment length has a specific kernel shape that yields Kircher-equivalent “+1 in the middle / -1 in the flanks” behavior.
 
 ### Fragment size filtering
 
-Only fragments in the configured length range contribute to WPS:
+Only fragments in the configured size range contribute to WPS:
 
-```
---frag-lower 120
---frag-upper 180
-```
+- `--frag-lower` (default `120`)
+- `--frag-upper` (default `180`)
 
-Coverage and dyad tracks are computed using true fragment coordinates.
+---
+
+## Tracks produced
+
+The script computes the following tracks over each processed region:
+
+- `coverage` — per-base fragment overlap count
+- `dyad` — per-base fragment midpoint count
+- `wps` — raw Kircher-style WPS kernel sum
+- `wps_smoothed` — Savitzky–Golay smoothing of `wps` (if possible given window length)
+- `mWPS` — `wps - rolling_median(wps)`
+- `sm_mWPS` — `wps_smoothed - rolling_median(wps)`
+
+**Peak calling uses `sm_mWPS`.**
 
 ---
 
 ## Baseline correction and smoothing
 
-WPS is baseline-shifted using a rolling median:
+### Rolling-median baseline
+A rolling median baseline is computed on the **raw** WPS track:
 
-- Default baseline window: **1000 bp**
-- Baseline is computed on the chosen WPS track (raw or smoothed; configurable in code version)
-- Subtracted to generate a median-centered track:
-  - `wps_baselined = wps - rolling_median(wps, 1000)`
+- `--baseline-window` (default `1000` bp)
 
-Smoothing uses Savitzky–Golay:
+The baseline is computed via a sliding median and extended at region edges by holding the first/last valid baseline value.
 
-- Default `--sg-window 21`
-- Default `--sg-order 2`
+### Savitzky–Golay smoothing
+Smoothing is applied to raw WPS (not to the baseline):
 
-The peak caller uses:
+- `--sg-window` (default `21`, must be odd and ≤ region length)
+- `--sg-order` (default `2`)
 
-- `wps_baselined_smoothed`
+Resulting smoothed track:
+- `wps_smoothed`
+
+The baseline-subtracted smoothed track:
+- `sm_mWPS = wps_smoothed - baseline`
 
 ---
 
-## Peak calling (Kircher-style)
+## Peak calling (Kircher-matched)
 
-Peak calling replicates Kircher’s `evaluateValues()` logic:
+Peak calling is designed to mirror Kircher’s `evaluateValues()` logic as closely as possible.
 
-1. Build **positive runs** where `ivalue > 0`
-2. Merge runs if separated by gaps ≤ `--peak-merge-gap` (default 5 bp), filling the gap with zeros
+Process (on a given track):
+
+1. Build runs where `value > 0`.
+2. Merge runs if separated by gaps ≤ `--peak-merge-gap` (default `5` bp), filling gaps with zeros.
 3. Evaluate merged runs:
-   - Accept region lengths in `[--peak-minlen, --peak-maxlen]` (default 50–150 bp)
-   - For long runs:
-     - if region length in `[--peak-maxlen, 3*--peak-maxlen]` (150–450 bp), split by **median thresholding** into candidate windows
-     - reject if region length > 450 bp (default)
-4. **Score threshold:** report only if the **maximum value inside a called window** exceeds:
-   - `--peak-varicutoff` (default 5)
+   - If run length is in `[--peak-minlen, --peak-maxlen]` (default 50–150 bp), compute median-based windows and report best.
+   - If run length is in `[--peak-maxlen, 3*--peak-maxlen]` (default 150–450 bp), split into median-threshold windows and report each segment that meets length constraints.
+   - Longer regions are rejected (default behavior is >450 bp, but you can override with `--peak-maxregion`).
+4. A window is reported only if its **maximum value** exceeds:
+   - `--peak-varicutoff` (default `5.0`)
 
-This cutoff corresponds to Kircher’s `variCutoff`.
+### What gets called
+- **Nucleosome regions**: peak calling on `sm_mWPS`
+- **Breakpoint peaks**: peak calling on `-1 * sm_mWPS`
+
+---
+
+## Fragment randomization modes
+
+Randomization modes match those in the imported PNS module.
+
+- `--randomize-mode none` (default)  
+  Use observed fragment positions.
+
+- `--randomize-mode uniform`  
+  Uniformly randomize fragment placements within each processed window.
+
+- `--randomize-mode dinuc_anchor` *(requires `--fasta`)*  
+  Randomize fragment placements while anchoring fragment start or end on matching dinucleotide contexts.
+
+Additional controls for dinucleotide-anchored randomization:
+- `--fasta <ref.fa>` *(must have `.fai`)*
+- `--anchor-prob-start` (default `0.5`) — probability of anchoring on fragment start vs end
+- `--max-anchor-tries` (default `30`) — attempts per fragment
+- `--randomize-fallback {uniform,keep,skip}` (default `uniform`) — behavior if no valid placement is found
 
 ---
 
@@ -156,39 +185,38 @@ This cutoff corresponds to Kircher’s `variCutoff`.
 
 #### Whole genome (all contigs in BAM header)
 ```bash
-python3 wps_with_nucleosome_peak_calling.py \
-  -b sample.bam
+python3 wps_with_nucleosome_peak_calling.py   -b sample.bam
 ```
 
 #### Restrict to a contig
 ```bash
-python3 wps_with_nucleosome_peak_calling.py \
-  -b sample.bam \
-  -c chr12
+python3 wps_with_nucleosome_peak_calling.py   -b sample.bam   -c chr12
 ```
 
-#### Restrict to a genomic interval
-Coordinates are interpreted as **0-based** with **end-exclusive** semantics:
+#### Restrict to an interval
+Intervals are interpreted as **0-based, end-exclusive**: `contig:start-end`
 ```bash
-python3 wps_with_nucleosome_peak_calling.py \
-  -b sample.bam \
-  -c chr12:52621135-52641135
+python3 wps_with_nucleosome_peak_calling.py   -b sample.bam   -c chr12:52621135-52641135
 ```
 
-#### Match Kircher-like defaults (typical)
+#### Write both bedGraph and `.wig.gz`, and only selected tracks
 ```bash
-python3 wps_with_nucleosome_peak_calling.py \
-  -b SRR452466.bowtie.sorted.bam \
-  --protection 120 \
-  --frag-lower 120 --frag-upper 180 \
-  -c chr12:52621135-52641135
+python3 wps_with_nucleosome_peak_calling.py   -b sample.bam   -c chr12:52621135-52641135   --score-format both   --score-tracks sm_mWPS wps coverage
 ```
 
-#### Multiple BAMs (pooled fragments)
+#### Disable all score tracks (peaks + summaries only)
 ```bash
-python3 wps_with_nucleosome_peak_calling.py \
-  -b sample1.bam sample2.bam \
-  -c chr12
+python3 wps_with_nucleosome_peak_calling.py   -b sample.bam   -c chr12:52621135-52641135   --score-format none
+```
+
+#### Randomize fragments uniformly
+```bash
+python3 wps_with_nucleosome_peak_calling.py   -b sample.bam   -c chr12:52621135-52641135   --randomize-mode uniform   --seed 1
+```
+
+#### Dinucleotide-anchored randomization
+```bash
+python3 wps_with_nucleosome_peak_calling.py   -b sample.bam   -c chr12:52621135-52641135   --randomize-mode dinuc_anchor   --fasta /path/to/ref.fa   --seed 1
 ```
 
 ---
@@ -196,58 +224,61 @@ python3 wps_with_nucleosome_peak_calling.py \
 ## Arguments
 
 ### Core inputs
+- `-b/--bamfiles` **(required)**: one or more paired-end BAMs
+- `-o/--out_prefix`: output prefix (default derived from BAM basename(s) and region)
+- `-c/--contigs`: contig(s) and optional interval(s), e.g. `chr12` or `chr12:51730340-52039340`
 
-| Argument | Meaning |
-|---|---|
-| `-b/--bamfiles` | One or more paired-end BAM files |
-| `-o/--out_prefix` | Output prefix (default derived from BAM basenames + region info) |
-| `-c/--contigs` | One or more contigs, optionally ranges `chr:start-end` |
+### WPS scoring
+- `--protection` (default `120`): protection window size (bp)
+- `--frag-lower` (default `127`): minimum fragment length contributing to WPS
+- `--frag-upper` (default `207`): maximum fragment length contributing to WPS
+- `--max-duplicates` (default `0`): maximum allowed duplicate fragments with identical `(start,end)` within the window
+- `--subsample` (default `None`): subsample proportion (e.g. `0.5` keeps ~50%)
 
-### WPS scoring parameters
+### Chunking / overlap
+- `--chunk-bp` (default `100000`): chunk size per contig
+- `--overlap-bp` (default `1000`): overlap padding for edge-safe scoring
 
-| Argument | Meaning |
-|---|---|
-| `--protection` | Protection window size (bp), default `120` |
-| `--frag-lower` | Minimum fragment length contributing to WPS |
-| `--frag-upper` | Maximum fragment length contributing to WPS |
-| `--max-duplicates` | Max allowed fragments with identical `(chrom,start,end)` |
-| `--subsample` | Keep each fragment with probability p (e.g. 0.5) |
+### Baseline / smoothing
+- `--baseline-window` (default `1000`): rolling median window (bp)
+- `--sg-window` (default `21`): Savitzky–Golay window (odd)
+- `--sg-order` (default `2`): Savitzky–Golay polynomial order
 
-### Chunking / padding parameters
+### Score-track output controls
+- `--score-format {bedgraph,wiggz,both,none}` (default `wiggz`)
+  - `bedgraph`: write `<prefix>_combined_scores.bedGraph`
+  - `wiggz`: write one `<prefix>_<track>.wig.gz` per selected track
+  - `both`: write both bedGraph and `.wig.gz`
+  - `none`: do not write any per-base score tracks
+- `--score-tracks` (default: `coverage sm_mWPS wps wps_smoothed mWPS dyad`)
+  - Valid: `coverage dyad wps wps_smoothed mWPS sm_mWPS`
+  - Use `--score-tracks none` to disable track writing (equivalent to empty list; still allows peaks/summaries).
 
-| Argument | Meaning |
-|---|---|
-| `--chunk-bp` | Chunk size per contig (default 100,000 bp) |
-| `--overlap-bp` | Overlap padding (default 1,000 bp) |
+### Peak calling
+- `--peak-minlen` (default `50`): minimum window length to report
+- `--peak-maxlen` (default `150`): maximum window length to report
+- `--peak-maxregion` (default `450`): reject merged positive regions longer than this (bp)
+- `--peak-merge-gap` (default `5`): merge positive runs across gaps ≤ this many bp
+- `--peak-varicutoff` (default `5.0`): minimum max score within a reported window
 
-### Baseline / smoothing parameters
-
-| Argument | Meaning |
-|---|---|
-| `--baseline-window` | Rolling median window (default 1000 bp) |
-| `--sg-window` | Savitzky–Golay smoothing window (odd, default 21) |
-| `--sg-order` | Savitzky–Golay polynomial order (default 2) |
-
-### Peak calling parameters (Kircher defaults)
-
-| Argument | Meaning |
-|---|---|
-| `--peak-minlen` | Minimum length for candidate regions/windows (default 50 bp) |
-| `--peak-maxlen` | Maximum length for reported windows (default 150 bp) |
-| `--peak-maxregion` | Reject positive regions longer than this (default 450 bp) |
-| `--peak-merge-gap` | Merge positive runs across gaps ≤ this (default 5 bp) |
-| `--peak-varicutoff` | Minimum max score in window to report (default 5.0) |
+### Randomization
+- `--seed` (default `None`): random seed (reproducibility)
+- `--randomize-mode {none,uniform,dinuc_anchor}` (default `none`)
+- `--fasta <ref.fa>`: required for `dinuc_anchor` (must have `.fai`)
+- `--anchor-prob-start` (default `0.5`)
+- `--max-anchor-tries` (default `30`)
+- `--randomize-fallback {uniform,keep,skip}` (default `uniform`)
 
 ---
 
 ## How contigs / regions are processed
 
-To scale to genome-wide BAMs efficiently, the script processes contigs in **windows**:
+To scale to genome-wide BAMs efficiently, contigs are processed in windows:
 
-- window length: **`--chunk-bp`** (default 100,000 bp)
-- overlap padding: **`--overlap-bp`** (default 1,000 bp on each side)
+- window length: `--chunk-bp` (default 100,000 bp)
+- overlap padding: `--overlap-bp` (default 1,000 bp) on both sides
 
-For each chunk, scoring is computed on the **adjusted** window including overlaps. Output writing trims back to the **original non-overhang** interval to avoid duplicated output from overlaps.
+Scoring is computed on the **adjusted window** (including overlap). Output is trimmed back to the **core interval** (`original_start`–`original_end`) to avoid duplication across adjacent chunks.
 
 ---
 
@@ -259,96 +290,71 @@ All outputs are prefixed with:
 <out_prefix>_prot<PROTECTION>_lower<LOWER>_upper<UPPER>_maxdup<MAXDUP>
 ```
 
-### 1) Combined per-base scores bedGraph
+If randomization is used, an additional suffix is appended:
 
-**File:**
 ```
-<out_prefix>_combined_scores.bedGraph
-```
-
-**Format:**
-1. chrom
-2. start
-3. end
-4. coverage
-5. dyad
-6. wps
-7. wps_smoothed
-8. wps_baselined
-9. wps_baselined_smoothed
-
-Example:
-```
-chr12   52621135  52621136  41  6  12.0  11.8  2.4  2.1
+..._rand<MODE>
 ```
 
----
+### Score tracks
 
-### 2) Nucleosome regions (positive peaks)
+#### bedGraph (combined)
+If `--score-format bedgraph` or `both`, this is written:
 
-**File:**
-```
-<out_prefix>_nucleosome_regions.bed
-```
+- `<prefix>_combined_scores.bedGraph`
 
-This is a **BED8** file formatted like Kircher’s output:
+The exact column layout is produced by the shared PNS `write_bedgraph()` helper; it includes the tracks computed by this script (coverage/dyad/wps/wps_smoothed/mWPS/sm_mWPS) in a consistent per-base format.
+
+#### `.wig.gz` (one file per track)
+If `--score-format wiggz` or `both`, and `--score-tracks` is non-empty, one gzipped fixedStep WIG is written per requested track:
+
+- `<prefix>_coverage.wig.gz`
+- `<prefix>_dyad.wig.gz`
+- `<prefix>_wps.wig.gz`
+- `<prefix>_wps_smoothed.wig.gz`
+- `<prefix>_mWPS.wig.gz`
+- `<prefix>_sm_mWPS.wig.gz`
+
+(Only the tracks listed in `--score-tracks` are written.)
+
+### Peak calls
+
+Two BED8 files are written (Kircher-style fields):
+
+- `<prefix>_nucleosome_regions.bed`
+- `<prefix>_breakpoint_peaks.bed`
 
 Columns:
-1. `chrom`
-2. `start` (BED 0-based)
-3. `end` (BED end-exclusive)
-4. `name` (chr:start-end in 1-based display style)
-5. `score` (max score in called window; reported as integer)
-6. `strand` (`+`)
-7. `thickStart` (peak midpoint start)
-8. `thickEnd` (peak midpoint end)
+1. chrom (e.g. `chr12`)
+2. start (0-based)
+3. end (end-exclusive)
+4. name (`<chrom_nochr>:<start>-<end>` in 1-based display style)
+5. score (integer; max score in reported window)
+6. strand (always `.`)
+7. thickStart (midpoint-1)
+8. thickEnd (midpoint)
 
 Example:
 ```
-chr12   51748712   51748745   12:51748713-51748745   6   +   51748728   51748729
+chr12   51748712   51748745   12:51748713-51748745   6   .   51748728   51748729
 ```
 
----
+### Fragment summaries
 
-### 3) Breakpoint peaks (negative peaks)
+Two files are always written:
 
-**File:**
-```
-<out_prefix>_breakpoint_peaks.bed
-```
-
-Same BED8 structure as nucleosome peaks, but called on the sign-flipped track to identify troughs.
-
----
-
-## Converting to bigWig / bigBed
-
-### Extract a single column from combined bedGraph
-
-Example: baselined+smoothed WPS (last column):
-```bash
-in="<prefix>_combined_scores.bedGraph"
-awk 'BEGIN{OFS="\t"} {print $1,$2,$3,$9}' "$in" > wps_baselined_smoothed.bedGraph
-```
-
-### bedGraph → bigWig
-```bash
-bedGraphToBigWig wps_baselined_smoothed.bedGraph chrom.sizes wps_baselined_smoothed.bw
-```
-
-### Peaks → bigBed
-
-Peaks are already BED8 and can be converted directly:
-```bash
-bedToBigBed <prefix>_nucleosome_regions.bed chrom.sizes <prefix>_nucleosome_regions.bb
-bedToBigBed <prefix>_breakpoint_peaks.bed chrom.sizes <prefix>_breakpoint_peaks.bb
-```
+- `<prefix>_fragment_summary.txt`
+  - `total_fragments_filtered_all`
+  - `total_fragments_used_in_range` *(only those within frag range used for WPS)*
+  - `unique_bases_covered_by_used_fragments`
+- `<prefix>_fragment_length_counts.tsv`
+  - two columns: `fragment_length`, `count`
 
 ---
 
 ## Conda / Mamba environment setup
 
-Example minimal environment:
+Minimal environment:
 
 ```bash
 mamba create -n wps_env -c conda-forge python=3.11 numpy scipy pysam tqdm
@@ -359,17 +365,5 @@ conda activate wps_env
 
 ## Notes
 
-- Input BAMs must be indexed (`.bai` in same directory).
-- The `-c contig:start-end` interval uses BED-style semantics:
-  - start is 0-based
-  - end is exclusive
-- Duplicate filtering is coordinate-based:
-  ```
-  (chrom, fragment_start, fragment_end)
-  ```
-- Peak calling follows Kircher’s constraints:
-  - report windows 50–150 bp
-  - allow splitting of 150–450 bp regions by median-threshold windows
-  - reject >450 bp regions
-  - require max score > 5 to report
-
+- Input BAMs must be indexed (`.bai` in the same directory).
+- `-c contig:start-end` uses **0-based start** and **end-exclusive** semantics.
