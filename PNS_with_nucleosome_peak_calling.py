@@ -606,9 +606,8 @@ def write_wig_gz_tracks(
     adjusted_start: int,
     original_start: int,
     original_end: int,
-    out_prefix: str,
+    handles: Dict[str, gzip.GzipFile],
     tracks: List[str],
-    first_region: bool,
 ):
     """
     Write fixedStep WIG, gzipped, one file per track:
@@ -627,29 +626,28 @@ def write_wig_gz_tracks(
     for track in tracks:
         if track not in scores:
             continue
+        if track not in handles:
+            continue
 
-        path = f"{out_prefix}_{track}.wig.gz"
-        mode = "wt" if first_region else "at"
-
+        f = handles[track]
         arr = scores[track][0][2]  # aligned to adjusted_start
+
         # fixedStep start is 1-based coordinate of first value
         wig_start_1based = original_start + 1
+        f.write(f"fixedStep chrom={chrom} start={wig_start_1based} step=1\n")
 
-        with gzip.open(path, mode) as f:
-            f.write(f"fixedStep chrom={chrom} start={wig_start_1based} step=1\n")
-            for pos in range(original_start, original_end):
-                i = pos - adjusted_start
-                if 0 <= i < len(arr):
-                    f.write(_wig_val_to_str(track, arr[i]) + "\n")
-                else:
-                    # Should not happen in normal overlap logic, but keep safe:
-                    f.write("0\n")
+        for pos in range(original_start, original_end):
+            i = pos - adjusted_start
+            if 0 <= i < len(arr):
+                f.write(_wig_val_to_str(track, arr[i]) + "\n")
+            else:
+                f.write("0\n")
 
 
 # ----------------------------
 # Peak writers
 # ----------------------------
-def write_bed_rows(rows, path, mode):
+def write_bed8_rows(rows, path, mode):
     """
     BED8 writer (WPS-like), with strand provided by rows.
     Each row: (chrom, start, end, name, score, strand, thick_start, thick_end)
@@ -661,140 +659,50 @@ def write_bed_rows(rows, path, mode):
             )
 
 
-def write_nucleosome_peaks_rich(peaks, contigs, out_prefix, first_region=False, flip_scores=False):
-    """
-    Current multi-column (rich) writer. Keeps your original output format.
-    """
-    mode = "w" if first_region else "a"
-    original_start, original_end = contigs[0]
-
-    nucleosome_filename = f"{out_prefix}.bed"
-    with open(nucleosome_filename, mode) as f:
-        for (contig, original_start_key), peak_data in peaks.items():
-            if not contig.startswith("chr"):
-                contig = f"chr{contig}"
-
-            num_positive_peaks = len(peak_data["adjusted_peaks"])
-            num_negative_peaks = len(peak_data["negative_peaks"])
-
-            for i in range(num_positive_peaks):
-                adjusted_peak = peak_data["adjusted_peaks"][i]
-                nucleosome_region_start = peak_data["nucleosome_regions"][i][0]
-                nucleosome_region_end = peak_data["nucleosome_regions"][i][1]
-                peak = peak_data["positive_peaks"][i]
-
-                if not (original_start <= peak < original_end):
-                    continue
-
-                upstream_index = None
-                downstream_index = None
-
-                for j in range(num_negative_peaks):
-                    if peak_data["negative_peaks"][j] < peak:
-                        upstream_index = j
-                    else:
-                        break
-
-                for j in range(num_negative_peaks):
-                    if peak_data["negative_peaks"][j] > peak:
-                        downstream_index = j
-                        break
-
-                if upstream_index is not None:
-                    upstream_negative_peak = peak_data["negative_peaks"][upstream_index]
-                    upstream_score = peak_data["negative_peak_scores"][upstream_index]
-                else:
-                    upstream_negative_peak = peak
-                    upstream_score = peak_data["positive_peak_scores"][i]
-
-                if downstream_index is not None:
-                    downstream_negative_peak = peak_data["negative_peaks"][downstream_index]
-                    downstream_score = peak_data["negative_peak_scores"][downstream_index]
-                else:
-                    downstream_negative_peak = peak
-                    downstream_score = peak_data["positive_peak_scores"][i]
-
-                if flip_scores:
-                    upstream_score *= -1
-                    downstream_score *= -1
-                    peak_score = -1 * peak_data["positive_peak_scores"][i]
-                else:
-                    peak_score = peak_data["positive_peak_scores"][i]
-
-                average_flanking_score = np.mean([upstream_score, downstream_score])
-                prominence_score = peak_score - average_flanking_score
-
-                max_coverage = peak_data["max_coverages"][i]
-                max_position = peak_data["max_positions"][i]
-
-                f.write(
-                    f"{contig}\t{nucleosome_region_start}\t{nucleosome_region_end}\t"
-                    f"{prominence_score:.2f}\t{adjusted_peak}\t"
-                    f"{upstream_score:.2f}\t{upstream_negative_peak}\t"
-                    f"{downstream_score:.2f}\t{downstream_negative_peak}\t"
-                    f"{peak_score:.2f}\t{peak}\t"
-                    f"{max_coverage}\t{max_position}\n"
-                )
-
-
-def peaks_to_bed8_rows(
-    peaks: dict,
-    original_start: int,
-    original_end: int,
-    label: str,
-    flip_scores: bool,
-    score_scale: float,
-) -> List[Tuple[str, int, int, str, int, str, int, int]]:
-    """
-    Convert internal peak dict to BED8 rows (WPS-like), with strand='.'.
-
-    We use:
-      chrom, region_start, region_end
-      name = f"{chrom}:{peak}_{label}"
-      score = round(prominence * score_scale) as int
-      strand = '.'
-      thickStart/thickEnd = peak/peak+1 (peak coordinate highlighted)
-    """
-    rows = []
-
+def iter_peak_records(peaks, original_start, original_end, flip_scores=False):
     for (contig, _orig_start_key), peak_data in peaks.items():
         chrom = contig if contig.startswith("chr") else f"chr{contig}"
 
-        num_positive_peaks = len(peak_data["adjusted_peaks"])
+        num_positive_peaks = len(peak_data["region_centres"])
         num_negative_peaks = len(peak_data["negative_peaks"])
 
         for i in range(num_positive_peaks):
             region_start = peak_data["nucleosome_regions"][i][0]
             region_end = peak_data["nucleosome_regions"][i][1]
-            peak = peak_data["positive_peaks"][i]
 
-            # Keep only peaks whose PEAK lies in the core region
-            if not (original_start <= peak < original_end):
+            region_centre = peak_data["region_centres"][i]
+            raw_peak = peak_data["positive_peaks"][i]
+
+            # choose which coordinate defines membership
+            if not (original_start <= region_centre < original_end):
                 continue
 
-            # Find flanking negative peaks (by position)
             upstream_index = None
             downstream_index = None
 
             for j in range(num_negative_peaks):
-                if peak_data["negative_peaks"][j] < peak:
+                if peak_data["negative_peaks"][j] < region_centre:
                     upstream_index = j
                 else:
                     break
 
             for j in range(num_negative_peaks):
-                if peak_data["negative_peaks"][j] > peak:
+                if peak_data["negative_peaks"][j] > region_centre:
                     downstream_index = j
                     break
 
             if upstream_index is not None:
+                upstream_negative_peak = peak_data["negative_peaks"][upstream_index]
                 upstream_score = peak_data["negative_peak_scores"][upstream_index]
             else:
+                upstream_negative_peak = region_centre
                 upstream_score = peak_data["positive_peak_scores"][i]
 
             if downstream_index is not None:
+                downstream_negative_peak = peak_data["negative_peaks"][downstream_index]
                 downstream_score = peak_data["negative_peak_scores"][downstream_index]
             else:
+                downstream_negative_peak = region_centre
                 downstream_score = peak_data["positive_peak_scores"][i]
 
             peak_score = peak_data["positive_peak_scores"][i]
@@ -804,16 +712,63 @@ def peaks_to_bed8_rows(
                 peak_score *= -1
 
             prominence = float(peak_score) - float(np.mean([upstream_score, downstream_score]))
-            score_int = int(round(prominence * score_scale))
 
-            name = f"{chrom}:{peak}_{label}"
-            strand = "."
-            thick_start = int(peak)
-            thick_end = int(peak) + 1
+            yield {
+                "chrom": chrom,
+                "region_start": int(region_start),
+                "region_end": int(region_end),
+                "region_centre": int(region_centre),
+                "raw_peak": int(raw_peak),
+                "upstream_negative_peak": int(upstream_negative_peak),
+                "downstream_negative_peak": int(downstream_negative_peak),
+                "upstream_score": float(upstream_score),
+                "downstream_score": float(downstream_score),
+                "peak_score": float(peak_score),
+                "prominence": float(prominence),
+                "max_coverage": peak_data["max_coverages"][i],
+                "max_position": peak_data["max_positions"][i],
+            }
 
-            rows.append((chrom, int(region_start), int(region_end), name, score_int, strand, thick_start, thick_end))
+
+def peaks_to_bed8_rows(peaks, original_start, original_end, label, flip_scores, score_scale):
+    rows = []
+
+    for rec in iter_peak_records(peaks, original_start, original_end, flip_scores):
+        score_int = int(round(rec["prominence"] * score_scale))
+        name = f'{rec["chrom"]}:{rec["region_centre"]}_{label}'
+        strand = "."
+        thick_start = rec["region_centre"]
+        thick_end = rec["region_centre"] + 1
+
+        rows.append((
+            rec["chrom"],
+            rec["region_start"],
+            rec["region_end"],
+            name,
+            score_int,
+            strand,
+            thick_start,
+            thick_end,
+        ))
 
     return rows
+
+
+def write_nucleosome_peaks_rich(peaks, contigs, out_prefix, first_region=False, flip_scores=False):
+    mode = "w" if first_region else "a"
+    original_start, original_end = contigs[0]
+
+    nucleosome_filename = f"{out_prefix}.bed"
+    with open(nucleosome_filename, mode) as f:
+        for rec in iter_peak_records(peaks, original_start, original_end, flip_scores):
+            f.write(
+                f'{rec["chrom"]}\t{rec["region_start"]}\t{rec["region_end"]}\t'
+                f'{rec["prominence"]:.2f}\t{rec["region_centre"]}\t'
+                f'{rec["upstream_score"]:.2f}\t{rec["upstream_negative_peak"]}\t'
+                f'{rec["downstream_score"]:.2f}\t{rec["downstream_negative_peak"]}\t'
+                f'{rec["peak_score"]:.2f}\t{rec["raw_peak"]}\t'
+                f'{rec["max_coverage"]}\t{rec["max_position"]}\n'
+            )
 
 
 def split_into_regions(contig, start, end, contig_len, max_length=100000, overlap=1000):
@@ -847,7 +802,7 @@ def call_and_write_peaks(
     peak_format: str,
     peak_score_scale: float,
 ):
-    positive_peaks, negative_peaks, adjusted_peaks = find_peaks_and_regions(
+    positive_peaks, negative_peaks, region_centres = find_peaks_and_regions(
         scores, adjusted_start, 50, 5
     )
 
@@ -855,7 +810,7 @@ def call_and_write_peaks(
     max_positions = []
     arr_len = coverage_scores.shape[0]
 
-    for start_abs, end_abs in adjusted_peaks[1]:
+    for start_abs, end_abs in region_centres[1]:
         region_start_idx = max(0, start_abs - adjusted_start)
         region_end_idx = min(arr_len - 1, end_abs - adjusted_start)
 
@@ -880,8 +835,8 @@ def call_and_write_peaks(
             "positive_peak_scores": positive_peaks[1],
             "negative_peaks": negative_peaks[0],
             "negative_peak_scores": negative_peaks[1],
-            "adjusted_peaks": adjusted_peaks[0],
-            "nucleosome_regions": adjusted_peaks[1],
+            "region_centres": region_centres[0],
+            "nucleosome_regions": region_centres[1],
             "max_coverages": max_coverages,
             "max_positions": max_positions,
         }
@@ -909,7 +864,7 @@ def call_and_write_peaks(
             flip_scores=flip_scores,
             score_scale=peak_score_scale,
         )
-        write_bed_rows(rows, out_path, mode=mode)
+        write_bed8_rows(rows, out_path, mode=mode)
     else:
         raise ValueError(f"Unknown peak_format: {peak_format}")
 
@@ -1175,6 +1130,13 @@ def main():
     unique_bases_covered_by_used = 0          # unique bases covered within original (non-overlap) spans
     length_counts = Counter()                 # length histogram for used fragments only
 
+    # Open wig.gz handles ONCE for the whole run
+    wig_handles = {}
+    if args.score_format in ("wiggz", "both") and args.score_tracks:
+        for track in args.score_tracks:
+            path = f"{args.out_prefix}_{track}.wig.gz"
+            wig_handles[track] = gzip.open(path, "wt")
+
     first_region = True
     for contig, adjusted_start, adjusted_end, original_start, original_end in tqdm(contigs, desc="Scoring contigs"):
         scores, pns_frag_range, fragments_filtered = score_contig(
@@ -1269,9 +1231,8 @@ def main():
                 adjusted_start=adjusted_start,
                 original_start=original_start,
                 original_end=original_end,
-                out_prefix=args.out_prefix,
+                handles=wig_handles,
                 tracks=args.score_tracks,
-                first_region=first_region,
             )
 
         first_region = False
@@ -1283,6 +1244,13 @@ def main():
         unique_bases_covered_by_used=unique_bases_covered_by_used,
         length_counts=length_counts,
     )
+
+    # Close wig.gz handles
+    for f in wig_handles.values():
+        try:
+            f.close()
+        except Exception:
+            pass
 
     # Close files
     for b in bamfiles:

@@ -30,6 +30,7 @@ import argparse
 import os
 import random
 import math
+import gzip
 from typing import List, Tuple, Optional
 from collections import Counter
 
@@ -762,6 +763,13 @@ def main():
     unique_bases_covered_by_used = 0
     length_counts = Counter()
 
+    # Open wig.gz handles ONCE for the whole run
+    wig_handles = {}
+    if args.score_format in ("wiggz", "both") and args.score_tracks:
+        for track in args.score_tracks:
+            path = f"{args.out_prefix}_{track}.wig.gz"
+            wig_handles[track] = gzip.open(path, "wt")
+
     first_region = True
     for contig, adjusted_start, adjusted_end, original_start, original_end in tqdm(contigs, desc="Scoring contigs"):
         scores, fragments_filtered = score_contig(
@@ -849,16 +857,14 @@ def main():
             write_bedgraph(scores, [(original_start, original_end)], args.out_prefix, first_region)
 
         if args.score_format in ("wiggz", "both") and args.score_tracks:
-            # Use the shared PNS writer (one file per track, fixedStep, gzipped)
             write_wig_gz_tracks(
                 scores=scores,
                 contig=contig,
                 adjusted_start=adjusted_start,
                 original_start=original_start,
                 original_end=original_end,
-                out_prefix=args.out_prefix,
+                handles=wig_handles,
                 tracks=args.score_tracks,
-                first_region=first_region,
             )
 
         first_region = False
@@ -870,6 +876,12 @@ def main():
         unique_bases_covered_by_used=unique_bases_covered_by_used,
         length_counts=length_counts,
     )
+
+    for f in wig_handles.values():
+        try:
+            f.close()
+        except Exception:
+            pass
 
     for b in bamfiles:
         try:
