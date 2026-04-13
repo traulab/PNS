@@ -6,7 +6,7 @@
 Fragmentomics scoring + peak calling pipeline.
 
 What this script does (high level):
-1) Reads paired-end fragments from one or more BAMs in a region (or whole genome).
+1) Reads paired-end fragments from one or more BAMs in a contig or contig region.
 2) Filters duplicates (same fragment coords) to max N and optionally subsamples.
 3) For each fragment length in a specified range, adds a precomputed PNS score
    distribution across the fragment.
@@ -28,6 +28,7 @@ Randomization modes:
   controlled by --anchor-prob-start), then place the fragment so its anchored boundary
   dinucleotide matches a random occurrence of that dinucleotide in the reference sequence
   for that window (requires --fasta)
+
 """
 
 import sys
@@ -90,8 +91,6 @@ def generate_paired_reads(
     subsample=None,
 ):
     """
-    Shared paired-end generator used by BOTH PNS and WPS.
-
     Behavior:
       - fetch(contig,start,end) with multiple_iterators=True
       - skip unmapped or mate-unmapped
@@ -194,9 +193,15 @@ def generate_fragment_ranges(
 
 def precompute_distributions(pns_frag_range, mode_DNA_length):
     """
-    Precompute per-fragment-length score “kernels” used to add PNS signal.
+    Precompute per-fragment-length score kernels used to add PNS signal.
+
+    Returns:
+      - pns_distributions: mean-normalized kernels
+      - pospns_distributions: same kernels before mean normalization
     """
-    distributions = {}
+    pns_distributions = {}
+    pospns_distributions = {}
+
     for fragment_length in pns_frag_range:
 
         if fragment_length < mode_DNA_length:
@@ -218,12 +223,13 @@ def precompute_distributions(pns_frag_range, mode_DNA_length):
         end_scores = scores[::-1]
         combined_scores = scores + end_scores
 
+        pospns_distributions[fragment_length] = combined_scores.copy()
+
         midpoint_val = np.mean(combined_scores)
         centered_scores = [x - midpoint_val for x in combined_scores]
+        pns_distributions[fragment_length] = centered_scores
 
-        distributions[fragment_length] = centered_scores
-
-    return distributions
+    return pns_distributions, pospns_distributions
 
 
 def build_dinuc_index(seq: str) -> Dict[str, List[int]]:
@@ -371,7 +377,8 @@ def score_contig(
     mode_DNA_length,
     pns_frag_range,
     max_duplicates,
-    distributions,
+    pns_distributions,
+    pospns_distributions,
     subsample,
     randomize_mode: str = "none",  # none|uniform|dinuc_anchor
     fasta: Optional[pysam.FastaFile] = None,
@@ -391,6 +398,7 @@ def score_contig(
     coverage = np.zeros(ref_len, dtype=int)
     dyad = np.zeros(ref_len, dtype=int)
     pns = np.zeros(ref_len, dtype=float)
+    pospns = np.zeros(ref_len, dtype=float)
 
     # 1) Collect all fragments for this window (after filtering/subsampling/dup logic)
     fragments: List[Tuple[int, int]] = []
@@ -424,13 +432,18 @@ def score_contig(
             fallback=randomize_fallback,
         )
 
-    # 3) Score (possibly randomized) fragments
+    # 3) Score fragments
     for frag_start, frag_end in fragments:
         frag_length = frag_end - frag_start
-        fragment_scores = distributions.get(frag_length)
+        pns_fragment_scores = pns_distributions.get(frag_length)
+        pospns_fragment_scores = pospns_distributions.get(frag_length)
 
-        # Add PNS-like kernel if fragment length in allowed range
-        if frag_length in pns_frag_range and fragment_scores:
+        # Add kernels if fragment length in allowed range
+        if (
+            frag_length in pns_frag_range
+            and pns_fragment_scores is not None
+            and pospns_fragment_scores is not None
+        ):
 
             if frag_length < mode_DNA_length:
                 total_length = mode_DNA_length + (mode_DNA_length - frag_length)
@@ -441,16 +454,21 @@ def score_contig(
                 start_pos = frag_start - start
                 end_pos = frag_end - start
 
+            pns_scores_to_add = np.array(pns_fragment_scores, dtype=float)
+            pospns_scores_to_add = np.array(pospns_fragment_scores, dtype=float)
+
             if start_pos < 0:
-                fragment_scores = fragment_scores[-start_pos:]
+                pns_scores_to_add = pns_scores_to_add[-start_pos:]
+                pospns_scores_to_add = pospns_scores_to_add[-start_pos:]
                 start_pos = 0
             if end_pos > ref_len:
-                fragment_scores = fragment_scores[: ref_len - start_pos]
+                trim_len = ref_len - start_pos
+                pns_scores_to_add = pns_scores_to_add[:trim_len]
+                pospns_scores_to_add = pospns_scores_to_add[:trim_len]
 
             if 0 <= start_pos < ref_len:
-                pns[start_pos : start_pos + len(fragment_scores)] += fragment_scores[
-                    : end_pos - start_pos
-                ]
+                pns[start_pos : start_pos + len(pns_scores_to_add)] += pns_scores_to_add
+                pospns[start_pos : start_pos + len(pospns_scores_to_add)] += pospns_scores_to_add
 
         # Coverage and dyad only for fragments fully contained, and within length range
         if frag_start >= start and frag_end <= end:
@@ -472,6 +490,7 @@ def score_contig(
         "coverage": [(contig, start, coverage)],
         "pns_smoothed": [(contig, start, pns_smoothed)],
         "pns": [(contig, start, pns)],
+        "posPNS": [(contig, start, pospns)],
         "dyad": [(contig, start, dyad)],
     }
 
@@ -632,7 +651,6 @@ def write_wig_gz_tracks(
         f = handles[track]
         arr = scores[track][0][2]  # aligned to adjusted_start
 
-        # fixedStep start is 1-based coordinate of first value
         wig_start_1based = original_start + 1
         f.write(f"fixedStep chrom={chrom} start={wig_start_1based} step=1\n")
 
@@ -673,7 +691,6 @@ def iter_peak_records(peaks, original_start, original_end, flip_scores=False):
             region_centre = peak_data["region_centres"][i]
             raw_peak = peak_data["positive_peaks"][i]
 
-            # choose which coordinate defines membership
             if not (original_start <= region_centre < original_end):
                 continue
 
@@ -842,7 +859,6 @@ def call_and_write_peaks(
         }
     }
 
-    # --- Write in requested peak format ---
     if peak_format == "rich":
         write_nucleosome_peaks_rich(
             peaks,
@@ -969,7 +985,6 @@ def main():
         help="For dinuc_anchor: what to do if no valid dinuc placement is found.",
     )
 
-    # Score-track output controls
     parser.add_argument(
         "--score-format",
         choices=["bedgraph", "wiggz", "both", "none"],
@@ -979,15 +994,14 @@ def main():
     parser.add_argument(
         "--score-tracks",
         nargs="*",
-        default=["coverage", "pns_smoothed", "pns", "dyad"],
+        default=["coverage", "pns_smoothed", "pns", "posPNS", "dyad"],
         help=(
             "Which score tracks to output (space-separated). "
-            "Valid: coverage pns_smoothed pns dyad. "
+            "Valid: coverage pns_smoothed pns posPNS dyad. "
             "Use '--score-tracks none' or '--score-format none' to disable."
         ),
     )
 
-    # Peak output controls
     parser.add_argument(
         "--peak-format",
         choices=["rich", "bed8"],
@@ -1003,8 +1017,7 @@ def main():
 
     args = parser.parse_args()
 
-    # Normalize --score-tracks none
-    valid_tracks = {"coverage", "pns_smoothed", "pns", "dyad"}
+    valid_tracks = {"coverage", "pns_smoothed", "pns", "posPNS", "dyad"}
     if args.score_tracks and len(args.score_tracks) == 1 and args.score_tracks[0].lower() == "none":
         args.score_tracks = []
     else:
@@ -1021,7 +1034,6 @@ def main():
     if args.randomize_mode == "dinuc_anchor" and not args.fasta:
         parser.error("--randomize-mode dinuc_anchor requires --fasta <ref.fa> (with .fai index).")
 
-    # Default output prefix
     if not args.out_prefix:
         bam_basenames = [os.path.splitext(os.path.basename(bam))[0] for bam in args.bamfiles]
         args.out_prefix = f"{'_'.join(bam_basenames)}"
@@ -1093,7 +1105,9 @@ def main():
 
     # Precompute kernels
     pns_frag_range = range(args.frag_lower, args.frag_upper + 1)
-    distributions = precompute_distributions(pns_frag_range, args.mode_length)
+    pns_distributions, pospns_distributions = precompute_distributions(
+        pns_frag_range, args.mode_length
+    )
 
     # Remove old outputs
     combined_bedgraph = f"{args.out_prefix}_combined_scores.bedGraph"
@@ -1111,7 +1125,6 @@ def main():
     if args.score_format in ("bedgraph", "both"):
         to_remove.append(combined_bedgraph)
 
-    # Peak outputs depend on format
     if args.peak_format == "rich":
         to_remove.extend([nucleosome_bed_rich, breakpoint_bed_rich])
     else:
@@ -1125,10 +1138,10 @@ def main():
             os.remove(fname)
 
     # Global fragment accounting
-    total_fragments_filtered_all = 0          # all filtered fragments that "belong" to a chunk
-    total_fragments_used_in_range = 0         # within [frag-lower, frag-upper] and belong to a chunk
-    unique_bases_covered_by_used = 0          # unique bases covered within original (non-overlap) spans
-    length_counts = Counter()                 # length histogram for used fragments only
+    total_fragments_filtered_all = 0
+    total_fragments_used_in_range = 0
+    unique_bases_covered_by_used = 0
+    length_counts = Counter()
 
     # Open wig.gz handles ONCE for the whole run
     wig_handles = {}
@@ -1147,7 +1160,8 @@ def main():
             mode_DNA_length=args.mode_length,
             pns_frag_range=pns_frag_range,
             max_duplicates=args.max_duplicates,
-            distributions=distributions,
+            pns_distributions=pns_distributions,
+            pospns_distributions=pospns_distributions,
             subsample=args.subsample,
             randomize_mode=args.randomize_mode,
             fasta=fasta,
@@ -1164,7 +1178,6 @@ def main():
 
         total_fragments_filtered_all += len(owned_fragments)
 
-        # Count used fragment lengths + unique bases covered in ORIGINAL region only
         if original_end > original_start:
             covered = np.zeros(original_end - original_start, dtype=bool)
 
@@ -1182,7 +1195,6 @@ def main():
                     covered[ov_start - original_start : ov_end - original_start] = True
 
             unique_bases_covered_by_used += int(covered.sum())
-        # -------------------------------------------------------------------------------
 
         pns_smoothed_scores = scores["pns_smoothed"][0][2]
         coverage_scores = scores["coverage"][0][2]
@@ -1245,14 +1257,12 @@ def main():
         length_counts=length_counts,
     )
 
-    # Close wig.gz handles
     for f in wig_handles.values():
         try:
             f.close()
         except Exception:
             pass
 
-    # Close files
     for b in bamfiles:
         try:
             b.close()
