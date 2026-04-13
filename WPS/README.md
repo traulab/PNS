@@ -228,8 +228,8 @@ python3 wps_with_nucleosome_peak_calling.py   -b sample.bam   -c chr12:52621135-
 
 ### WPS scoring
 - `--protection` (default `120`): protection window size (bp)
-- `--frag-lower` (default `127`): minimum fragment length contributing to WPS
-- `--frag-upper` (default `207`): maximum fragment length contributing to WPS
+- `--frag-lower` (default `120`): minimum fragment length contributing to WPS
+- `--frag-upper` (default `180`): maximum fragment length contributing to WPS
 - `--max-duplicates` (default `0`): maximum allowed duplicate fragments with identical `(start,end)` within the window
 - `--subsample` (default `None`): subsample proportion (e.g. `0.5` keeps ~50%)
 
