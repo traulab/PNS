@@ -519,7 +519,7 @@ def find_peaks_and_regions(scores, original_start, min_length=50, max_neg_run=5)
                     neg_count += 1
                     if neg_count == 1:
                         last_positive_end = i - 1
-                    if neg_count >= max_neg_run:
+                    if neg_count > max_neg_run:
                         if last_positive_end is not None and last_positive_end - current_region[0] + 1 >= min_length:
                             positive_regions.append([current_region[0], last_positive_end])
                         current_region = None
@@ -728,7 +728,8 @@ def iter_peak_records(peaks, original_start, original_end, flip_scores=False):
                 downstream_score *= -1
                 peak_score *= -1
 
-            prominence = float(peak_score) - float(np.mean([upstream_score, downstream_score]))
+            # prominence = float(peak_score) - float(np.mean([upstream_score, downstream_score]))
+            peak_height = float(peak_score)
 
             yield {
                 "chrom": chrom,
@@ -741,7 +742,7 @@ def iter_peak_records(peaks, original_start, original_end, flip_scores=False):
                 "upstream_score": float(upstream_score),
                 "downstream_score": float(downstream_score),
                 "peak_score": float(peak_score),
-                "prominence": float(prominence),
+                "prominence": float(peak_height),
                 "max_coverage": peak_data["max_coverages"][i],
                 "max_position": peak_data["max_positions"][i],
             }
