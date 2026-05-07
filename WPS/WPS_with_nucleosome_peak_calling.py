@@ -2,10 +2,10 @@
 """
 @author Andrew D Johnston
 
-Kircher-style WPS scoring + median-centering + Kircher-closely-matched peak calling
+Kircher-style WPS scoring + median-centering + selectable peak calling
 
 This version IMPORTS shared helper functions from:
-  PNS_with_nucleosome_peak_calling.py  (located one directory down)
+  PNS_with_nucleosome_peak_calling.py
 
 Shared helpers imported from PNS
   - resolve_fasta_contig
@@ -18,11 +18,16 @@ Shared helpers imported from PNS
   - write_wig_gz_tracks
   - generate_paired_reads
   - generate_fragment_ranges
+  - call_and_write_peaks (optional, for --peak-caller pns)
 
 Randomization modes (same as PNS):
   - none (default)
   - uniform
   - dinuc_anchor (requires --fasta)
+
+Peak caller modes:
+  - wps : current Kircher-style WPS peak caller
+  - pns : use imported PNS peak caller on the selected WPS-derived track
 """
 
 import sys
@@ -78,7 +83,7 @@ def _import_pns_helpers():
     # 4) Siblings (subdirs of parent)
     candidates.extend(glob.glob(os.path.join(parent, "*", target_name)))
 
-    # 5) Depth-limited recursive fallback (covers weird layouts)
+    # 5) Depth-limited recursive fallback
     candidates.extend(glob.glob(os.path.join(here, "**", target_name), recursive=True))
     candidates.extend(glob.glob(os.path.join(parent, "**", target_name), recursive=True))
 
@@ -96,7 +101,6 @@ def _import_pns_helpers():
         mod = importlib.util.module_from_spec(spec)
         try:
             spec.loader.exec_module(mod)
-            # Basic sanity check that we got the right module
             if not hasattr(mod, "generate_paired_reads"):
                 continue
             print(f"[WPS] Imported PNS helpers from: {path}", file=sys.stderr)
@@ -125,6 +129,7 @@ require_bam_indexes = _pns.require_bam_indexes
 split_into_regions = _pns.split_into_regions
 write_bedgraph = _pns.write_bedgraph
 write_wig_gz_tracks = getattr(_pns, "write_wig_gz_tracks", None)
+call_and_write_peaks_pns = getattr(_pns, "call_and_write_peaks", None)
 
 # shared fragment extraction / filtering
 generate_paired_reads = _pns.generate_paired_reads
@@ -188,7 +193,7 @@ def rolling_median(x: np.ndarray, window: int = 1000) -> np.ndarray:
         return np.full(n, np.nan, dtype=float)
 
     wins = sliding_window_view(x, window_shape=window)
-    med = np.median(wins, axis=1)  # length n-window+1
+    med = np.median(wins, axis=1)
 
     out = np.full(n, np.nan, dtype=float)
     half = window // 2
@@ -212,12 +217,11 @@ def score_contig(
     baseline_window: int = 1000,
     sg_window: int = 21,
     sg_order: int = 2,
-    # Randomization (same flags/behavior as PNS)
-    randomize_mode: str = "none",  # none|uniform|dinuc_anchor
+    randomize_mode: str = "none",
     fasta: Optional[pysam.FastaFile] = None,
     anchor_prob_start: float = 0.5,
     max_anchor_tries: int = 30,
-    randomize_fallback: str = "uniform",  # uniform|keep|skip
+    randomize_fallback: str = "uniform",
 ):
     """
     Compute tracks over [start,end):
@@ -238,7 +242,6 @@ def score_contig(
 
     half = protection // 2
 
-    # 1) Collect fragments for this window (shared PNS logic)
     fragments: List[Tuple[int, int]] = []
     for bamfile in bamfiles:
         for frag_start, frag_end in generate_fragment_ranges(
@@ -247,7 +250,6 @@ def score_contig(
             if frag_end > frag_start:
                 fragments.append((frag_start, frag_end))
 
-    # 2) Randomize fragments (shared functions from PNS)
     if randomize_mode == "uniform" and fragments:
         fragments = uniform_randomize_fragments(fragments, start, end)
 
@@ -271,24 +273,20 @@ def score_contig(
             fallback=randomize_fallback,
         )
 
-    # 3) Score fragments (possibly randomized)
     for frag_start, frag_end in fragments:
         L_true = frag_end - frag_start
         if L_true <= 0:
             continue
 
-        # Coverage (true overlap)
         cov_s = max(frag_start, start)
         cov_e = min(frag_end, end)
         if cov_e > cov_s:
             coverage[cov_s - start : cov_e - start] += 1
 
-        # Dyad (true midpoint)
         frag_center = frag_start + (L_true - 1) // 2
         if start <= frag_center < end:
             dyad[frag_center - start] += 1
 
-        # WPS kernel sum
         if L_true not in wps_frag_range:
             continue
 
@@ -296,7 +294,6 @@ def score_contig(
         if kernel is None or kernel.size == 0:
             continue
 
-        # Effective placement matching Kircher bx overlap domain
         kernel_start_genome = frag_start - half + 1
 
         k_s = kernel_start_genome - start
@@ -312,13 +309,11 @@ def score_contig(
 
         wps[arr_s:arr_e] += kernel[ker_s:ker_e].astype(np.float64)
 
-    # Smooth raw WPS
     if ref_len >= sg_window and sg_window % 2 == 1:
         wps_smoothed = savgol_filter(wps, sg_window, sg_order)
     else:
         wps_smoothed = wps.copy()
 
-    # Baseline = rolling median of RAW WPS
     baseline = rolling_median(wps, window=baseline_window)
     if np.isnan(baseline).any():
         valid = np.where(~np.isnan(baseline))[0]
@@ -474,7 +469,7 @@ def call_peaks_kircher_matched(
     n = int(track.size)
     for i in range(n):
         ivalue = float(track[i])
-        ipos = int(adjusted_start0 + i + 1)  # 1-based
+        ipos = int(adjusted_start0 + i + 1)
 
         if ivalue > 0:
             if (cend is not None) and (ipos <= (cend + merge_gap_bp)):
@@ -555,7 +550,7 @@ def write_fragment_outputs(
 # ----------------------------
 def main():
     parser = argparse.ArgumentParser(
-        description="Kircher-style WPS scoring + median-centering + Kircher-matched peak calling."
+        description="Kircher-style WPS scoring + median-centering + selectable peak calling."
     )
     parser.add_argument("-b", "--bamfiles", nargs="+", required=True, help="BAM file(s) to process")
     parser.add_argument("-o", "--out_prefix", default=None, help="Output prefix")
@@ -570,14 +565,13 @@ def main():
     parser.add_argument("--frag-lower", type=int, default=120, help="Lower fragment size to include in WPS")
     parser.add_argument("--frag-upper", type=int, default=180, help="Upper fragment size to include in WPS")
     parser.add_argument("--max-duplicates", type=int, default=0, help="Maximum allowed duplicate fragments (same coords)")
-    parser.add_argument("--subsample", type=float, default=None, help="Subsampling proportion (e.g. 0.5 keeps ~50%)")
+    parser.add_argument("--subsample", type=float, default=None, help="Subsampling proportion (e.g. 0.5 keeps ~50%%)")
     parser.add_argument("--chunk-bp", type=int, default=100000, help="Chunk size per contig")
     parser.add_argument("--overlap-bp", type=int, default=1000, help="Overlap padding for edge-safe scoring")
     parser.add_argument("--baseline-window", type=int, default=1000, help="Rolling median window for baseline subtraction")
     parser.add_argument("--sg-window", type=int, default=21, help="Savitzky-Golay window (odd)")
     parser.add_argument("--sg-order", type=int, default=2, help="Savitzky-Golay polynomial order")
 
-    # Score-track output controls
     parser.add_argument(
         "--score-format",
         choices=["bedgraph", "wiggz", "both", "none"],
@@ -595,14 +589,19 @@ def main():
         ),
     )
 
-    # Peak calling controls
+    parser.add_argument(
+        "--peak-caller",
+        choices=["wps", "pns"],
+        default="wps",
+        help="Choose peak caller: 'wps' uses Kircher-style WPS peak calling; 'pns' uses imported PNS peak caller.",
+    )
+
     parser.add_argument("--peak-minlen", type=int, default=50, help="Minimum length (bp) for candidate windows")
     parser.add_argument("--peak-maxlen", type=int, default=150, help="Maximum length (bp) for reported windows")
     parser.add_argument("--peak-maxregion", type=int, default=450, help="Reject merged regions longer than this (bp)")
     parser.add_argument("--peak-merge-gap", type=int, default=5, help="Merge positive runs if gap <= this many bp")
     parser.add_argument("--peak-varicutoff", type=float, default=5.0, help="Minimum max score to report a peak window")
 
-    # Randomization controls (same as PNS)
     parser.add_argument("--seed", type=int, default=None, help="Random seed (for reproducibility)")
     parser.add_argument(
         "--randomize-mode",
@@ -636,7 +635,6 @@ def main():
 
     args = parser.parse_args()
 
-    # Normalize --score-tracks none + validate
     valid_tracks = {"coverage", "dyad", "wps", "wps_smoothed", "mWPS", "sm_mWPS"}
     if args.score_tracks and len(args.score_tracks) == 1 and args.score_tracks[0].lower() == "none":
         args.score_tracks = []
@@ -649,6 +647,12 @@ def main():
         parser.error(
             "This WPS script was asked to write --score-format wiggz/both, but the imported PNS module "
             "does not provide write_wig_gz_tracks(). Please update/repoint PNS_with_nucleosome_peak_calling.py."
+        )
+
+    if args.peak_caller == "pns" and not callable(call_and_write_peaks_pns):
+        parser.error(
+            "This WPS script was asked to use --peak-caller pns, but the imported PNS module "
+            "does not provide call_and_write_peaks(). Please update/repoint PNS_with_nucleosome_peak_calling.py."
         )
 
     if args.seed is not None:
@@ -747,7 +751,6 @@ def main():
 
     wig_paths = [f"{args.out_prefix}_{t}.wig.gz" for t in args.score_tracks]
 
-    # Remove old outputs (respecting format choices)
     to_remove = [nuc_bed, brk_bed, frag_summary, frag_lens]
     if args.score_format in ("bedgraph", "both"):
         to_remove.append(combined_bedgraph)
@@ -763,12 +766,11 @@ def main():
     unique_bases_covered_by_used = 0
     length_counts = Counter()
 
-    # Open wig.gz handles ONCE for the whole run
     wig_handles = {}
     if args.score_format in ("wiggz", "both") and args.score_tracks:
-        for track in args.score_tracks:
-            path = f"{args.out_prefix}_{track}.wig.gz"
-            wig_handles[track] = gzip.open(path, "wt")
+        for track_name in args.score_tracks:
+            path = f"{args.out_prefix}_{track_name}.wig.gz"
+            wig_handles[track_name] = gzip.open(path, "wt")
 
     first_region = True
     for contig, adjusted_start, adjusted_end, original_start, original_end in tqdm(contigs, desc="Scoring contigs"):
@@ -814,45 +816,81 @@ def main():
             unique_bases_covered_by_used += int(covered.sum())
 
         track = scores["sm_mWPS"][0][2]
+        coverage_scores = scores["coverage"][0][2]
 
-        nuc_rows = call_peaks_kircher_matched(
-            contig=contig,
-            adjusted_start0=adjusted_start,
-            track=track,
-            merge_gap_bp=args.peak_merge_gap,
-            minlength=args.peak_minlen,
-            maxlength=args.peak_maxlen,
-            vari_cutoff=args.peak_varicutoff,
-        )
-        brk_rows = call_peaks_kircher_matched(
-            contig=contig,
-            adjusted_start0=adjusted_start,
-            track=(-1.0 * track),
-            merge_gap_bp=args.peak_merge_gap,
-            minlength=args.peak_minlen,
-            maxlength=args.peak_maxlen,
-            vari_cutoff=args.peak_varicutoff,
-        )
+        if args.peak_caller == "wps":
+            nuc_rows = call_peaks_kircher_matched(
+                contig=contig,
+                adjusted_start0=adjusted_start,
+                track=track,
+                merge_gap_bp=args.peak_merge_gap,
+                minlength=args.peak_minlen,
+                maxlength=args.peak_maxlen,
+                vari_cutoff=args.peak_varicutoff,
+            )
+            brk_rows = call_peaks_kircher_matched(
+                contig=contig,
+                adjusted_start0=adjusted_start,
+                track=(-1.0 * track),
+                merge_gap_bp=args.peak_merge_gap,
+                minlength=args.peak_minlen,
+                maxlength=args.peak_maxlen,
+                vari_cutoff=args.peak_varicutoff,
+            )
 
-        if args.peak_maxregion != 3 * args.peak_maxlen:
-            nuc_rows = [r for r in nuc_rows if (r[2] - r[1]) <= args.peak_maxregion]
-            brk_rows = [r for r in brk_rows if (r[2] - r[1]) <= args.peak_maxregion]
+            if args.peak_maxregion != 3 * args.peak_maxlen:
+                nuc_rows = [r for r in nuc_rows if (r[2] - r[1]) <= args.peak_maxregion]
+                brk_rows = [r for r in brk_rows if (r[2] - r[1]) <= args.peak_maxregion]
 
-        def keep_core(rows):
-            out = []
-            for chrom, s, e, name, score, strand, ts, te in rows:
-                if e <= original_start or s >= original_end:
-                    continue
-                out.append((chrom, s, e, name, score, strand, ts, te))
-            return out
+            def keep_core(rows):
+                out = []
+                for chrom, s, e, name, score, strand, ts, te in rows:
+                    if e <= original_start or s >= original_end:
+                        continue
+                    out.append((chrom, s, e, name, score, strand, ts, te))
+                return out
 
-        nuc_rows = keep_core(nuc_rows)
-        brk_rows = keep_core(brk_rows)
+            nuc_rows = keep_core(nuc_rows)
+            brk_rows = keep_core(brk_rows)
 
-        write_bed_rows(nuc_rows, nuc_bed, mode=("w" if first_region else "a"))
-        write_bed_rows(brk_rows, brk_bed, mode=("w" if first_region else "a"))
+            write_bed_rows(nuc_rows, nuc_bed, mode=("w" if first_region else "a"))
+            write_bed_rows(brk_rows, brk_bed, mode=("w" if first_region else "a"))
 
-        # Per-base score tracks
+        elif args.peak_caller == "pns":
+            call_and_write_peaks_pns(
+                scores=track,
+                coverage_scores=coverage_scores,
+                adjusted_start=adjusted_start,
+                original_start=original_start,
+                original_end=original_end,
+                contig=contig,
+                out_prefix=args.out_prefix,
+                first_region=first_region,
+                peak_type_label="_nucleosome_regions",
+                flip_scores=False,
+                peak_format="bed8",
+                peak_score_scale=1.0,
+                min_region_length=args.peak_minlen,
+                max_neg_run=args.peak_merge_gap,
+            )
+
+            call_and_write_peaks_pns(
+                scores=(-1.0 * track),
+                coverage_scores=coverage_scores,
+                adjusted_start=adjusted_start,
+                original_start=original_start,
+                original_end=original_end,
+                contig=contig,
+                out_prefix=args.out_prefix,
+                first_region=first_region,
+                peak_type_label="_breakpoint_peaks",
+                flip_scores=True,
+                peak_format="bed8",
+                peak_score_scale=1.0,
+                min_region_length=args.peak_minlen,
+                max_neg_run=args.peak_merge_gap,
+            )
+
         if args.score_format in ("bedgraph", "both"):
             write_bedgraph(scores, [(original_start, original_end)], args.out_prefix, first_region)
 

@@ -399,6 +399,7 @@ def score_contig(
     dyad = np.zeros(ref_len, dtype=int)
     pns = np.zeros(ref_len, dtype=float)
     pospns = np.zeros(ref_len, dtype=float)
+    fragment_ends = np.zeros(ref_len, dtype=int)
 
     # 1) Collect all fragments for this window (after filtering/subsampling/dup logic)
     fragments: List[Tuple[int, int]] = []
@@ -470,13 +471,24 @@ def score_contig(
                 pns[start_pos : start_pos + len(pns_scores_to_add)] += pns_scores_to_add
                 pospns[start_pos : start_pos + len(pospns_scores_to_add)] += pospns_scores_to_add
 
-        # Coverage and dyad only for fragments fully contained, and within length range
+        # Coverage, dyad, and fragment ends
         if frag_start >= start and frag_end <= end:
             if frag_length in pns_frag_range:
                 coverage[frag_start - start : frag_end - start] += 1
+
+                # Dyad
                 fragment_center = frag_start + (frag_length // 2) - start
                 if 0 <= fragment_center < ref_len:
                     dyad[fragment_center] += 1
+
+                # Fragment ends (both ends)
+                left_end = frag_start - start
+                right_end = frag_end - 1 - start
+
+                if 0 <= left_end < ref_len:
+                    fragment_ends[left_end] += 1
+                if 0 <= right_end < ref_len:
+                    fragment_ends[right_end] += 1
 
     # 4) Smooth PNS
     window_size = 21
@@ -492,12 +504,13 @@ def score_contig(
         "pns": [(contig, start, pns)],
         "posPNS": [(contig, start, pospns)],
         "dyad": [(contig, start, dyad)],
+        "fragment_ends": [(contig, start, fragment_ends)],
     }
 
     return scores, pns_frag_range, fragments
 
 
-def find_peaks_and_regions(scores, original_start, min_length=50, max_neg_run=5):
+def find_peaks_and_regions(scores, original_start, min_length, max_neg_run):
     positive_regions = []
     current_region = None
     searching_for_positive = True
@@ -560,11 +573,15 @@ def find_peaks_and_regions(scores, original_start, min_length=50, max_neg_run=5)
         positive_peaks.append(peak_index)
         positive_peak_scores.append(scores[peak_index])
 
+    # Convert to BED-style intervals
     positive_peak_regions = [
-        (region[0] + original_start, region[1] + original_start) for region in positive_regions
+        (region[0] + original_start, region[1] + original_start + 1)
+        for region in positive_regions
     ]
+
     adjusted_positive_peaks = [
-        (region[0] + region[1]) // 2 + original_start for region in positive_regions
+        (start + end) // 2
+        for start, end in positive_peak_regions
     ]
 
     positive_peaks = [p + original_start for p in positive_peaks]
@@ -614,7 +631,7 @@ def write_bedgraph(scores, contigs, out_prefix, first_region=False):
 
 
 def _wig_val_to_str(track: str, v) -> str:
-    if track in ("coverage", "dyad"):
+    if track in ("coverage", "dyad", "fragment_ends"):
         return str(int(v))
     return f"{float(v):.6f}"
 
@@ -819,9 +836,14 @@ def call_and_write_peaks(
     flip_scores,
     peak_format: str,
     peak_score_scale: float,
+    min_region_length,
+    max_neg_run,
 ):
     positive_peaks, negative_peaks, region_centres = find_peaks_and_regions(
-        scores, adjusted_start, 50, 5
+        scores,
+        adjusted_start,
+        min_region_length,
+        max_neg_run
     )
 
     max_coverages = []
@@ -947,8 +969,8 @@ def main():
     parser.add_argument("-o", "--out_prefix", help="prefix for output files (default: based on BAM names and contigs)")
     parser.add_argument("-c", "--contigs", nargs="+", help='limit to contig(s) and optional range, e.g. "2:100000-200000"')
     parser.add_argument("--mode-length", type=int, default=167, help="Mode fragment length (used in kernel geometry)")
-    parser.add_argument("--frag-lower", type=int, default=127, help="Lower fragment length to include")
-    parser.add_argument("--frag-upper", type=int, default=207, help="Upper fragment length to include")
+    parser.add_argument("--frag-lower", type=int, default=137, help="Lower fragment length to include")
+    parser.add_argument("--frag-upper", type=int, default=197, help="Upper fragment length to include")
     parser.add_argument("--max-duplicates", type=int, default=0, help="Max allowed duplicate fragments with same coords")
     parser.add_argument("--chunk-bp", type=int, default=100000, help="Chunk size for windowing")
     parser.add_argument("--overlap-bp", type=int, default=1000, help="Overlap padding on each side of chunk")
@@ -995,7 +1017,7 @@ def main():
     parser.add_argument(
         "--score-tracks",
         nargs="*",
-        default=["coverage", "pns_smoothed", "pns", "posPNS", "dyad"],
+        default=["coverage", "pns_smoothed", "pns", "posPNS", "dyad", "fragment_ends"],
         help=(
             "Which score tracks to output (space-separated). "
             "Valid: coverage pns_smoothed pns posPNS dyad. "
@@ -1016,9 +1038,23 @@ def main():
         help="Only for --peak-format bed8: score = round(prominence * scale) written as int.",
     )
 
+    parser.add_argument(
+        "--min-region-length",
+        type=int,
+        default=50,
+        help="Minimum length (bp) of positive regions"
+    )
+
+    parser.add_argument(
+        "--max-neg-run",
+        type=int,
+        default=5,
+        help="Maximum consecutive non-positive bases allowed within a positive region"
+    )
+
     args = parser.parse_args()
 
-    valid_tracks = {"coverage", "pns_smoothed", "pns", "posPNS", "dyad"}
+    valid_tracks = {"coverage", "pns_smoothed", "pns", "posPNS", "dyad", "fragment_ends"}
     if args.score_tracks and len(args.score_tracks) == 1 and args.score_tracks[0].lower() == "none":
         args.score_tracks = []
     else:
@@ -1214,6 +1250,8 @@ def main():
             flip_scores=False,
             peak_format=args.peak_format,
             peak_score_scale=args.peak_score_scale,
+            min_region_length=args.min_region_length,
+            max_neg_run=args.max_neg_run,
         )
 
         # Breakpoint peaks (flip sign)
@@ -1231,6 +1269,8 @@ def main():
             flip_scores=True,
             peak_format=args.peak_format,
             peak_score_scale=args.peak_score_scale,
+            min_region_length=args.min_region_length,
+            max_neg_run=args.max_neg_run,
         )
 
         # Per-base scores, trimmed to non-overlap region

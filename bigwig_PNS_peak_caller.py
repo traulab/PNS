@@ -155,7 +155,7 @@ def find_peaks_and_regions(
         positive_peak_scores.append(float(scores[peak_index]))
 
     positive_peak_regions = [
-        (region[0] + original_start, region[1] + original_start)
+        (region[0] + original_start, region[1] + original_start + 1)
         for region in positive_regions
     ]
     adjusted_positive_peaks = [
