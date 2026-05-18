@@ -645,38 +645,50 @@ def write_wig_gz_tracks(
     handles: Dict[str, gzip.GzipFile],
     tracks: List[str],
 ):
-    """
-    Write fixedStep WIG, gzipped, one file per track:
-      <out_prefix>_<track>.wig.gz
-
-    WIG fixedStep 'start' is 1-based. We write the core (non-overlap) region only.
-    """
     if not tracks:
         return
 
     chrom = contig if contig.startswith("chr") else f"chr{contig}"
-    core_len = max(0, original_end - original_start)
-    if core_len == 0:
-        return
+
+    if not hasattr(write_wig_gz_tracks, "_last_varstep_chrom"):
+        write_wig_gz_tracks._last_varstep_chrom = {}
 
     for track in tracks:
-        if track not in scores:
-            continue
-        if track not in handles:
+        if track not in scores or track not in handles:
             continue
 
         f = handles[track]
-        arr = scores[track][0][2]  # aligned to adjusted_start
+        arr = scores[track][0][2]
 
-        wig_start_1based = original_start + 1
-        f.write(f"fixedStep chrom={chrom} start={wig_start_1based} step=1\n")
+        if track in ("dyad", "fragment_ends"):
 
-        for pos in range(original_start, original_end):
-            i = pos - adjusted_start
-            if 0 <= i < len(arr):
-                f.write(_wig_val_to_str(track, arr[i]) + "\n")
-            else:
-                f.write("0\n")
+            last_chrom = write_wig_gz_tracks._last_varstep_chrom.get(track)
+
+            if last_chrom != chrom:
+                f.write(f"variableStep chrom={chrom}\n")
+                write_wig_gz_tracks._last_varstep_chrom[track] = chrom
+
+            for pos in range(original_start, original_end):
+                i = pos - adjusted_start
+                if not (0 <= i < len(arr)):
+                    continue
+
+                value = arr[i]
+                if value == 0:
+                    continue
+
+                f.write(f"{pos + 1}\t{int(value)}\n")
+
+        else:
+            wig_start_1based = original_start + 1
+            f.write(f"fixedStep chrom={chrom} start={wig_start_1based} step=1\n")
+
+            for pos in range(original_start, original_end):
+                i = pos - adjusted_start
+                if 0 <= i < len(arr):
+                    f.write(_wig_val_to_str(track, arr[i]) + "\n")
+                else:
+                    f.write("0\n")
 
 
 # ----------------------------
