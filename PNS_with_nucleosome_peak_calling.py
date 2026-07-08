@@ -10,11 +10,12 @@ What this script does (high level):
 2) Filters duplicates (same fragment coords) to max N and optionally subsamples.
 3) For each fragment length in a specified range, adds a precomputed PNS score
    distribution across the fragment.
-4) Also computes simple coverage and a dyad count (fragment centre) track.
-5) Smooths the PNS track (Savitzky–Golay).
-6) Calls:
+4) Also computes simple coverage, dyad count (fragment centre), and fragment-end tracks.
+5) Optionally smooths the PNS track (Savitzky–Golay).
+6) Optionally calls PNS-based peaks:
    - positive peaks ("nucleosome regions") on smoothed PNS
    - negative peaks ("breakpoint peaks") by flipping the PNS sign and re-calling
+   Use --pns-mode off to skip PNS scoring, smoothing, and peak calling.
 7) Writes (configurable):
    - bedGraph (combined multi-track bedGraph; legacy behavior)
    - wig.gz (one file per track; fixedStep)
@@ -380,6 +381,7 @@ def score_contig(
     pns_distributions,
     pospns_distributions,
     subsample,
+    pns_mode: str = "on",  # on|off
     randomize_mode: str = "none",  # none|uniform|dinuc_anchor
     fasta: Optional[pysam.FastaFile] = None,
     anchor_prob_start: float = 0.5,
@@ -391,15 +393,21 @@ def score_contig(
 
     Randomization (within this window) is applied BEFORE scoring if requested.
 
+    If pns_mode == "off", only non-PNS tracks are computed; PNS kernels,
+    smoothing, and PNS-derived peak calling are skipped by main().
+
     Returns:
       scores, pns_frag_range, fragments_filtered (post-filter/subsample/dup, post-randomize)
     """
+    do_pns = (pns_mode == "on")
     ref_len = end - start
     coverage = np.zeros(ref_len, dtype=int)
-    dyad = np.zeros(ref_len, dtype=int)
-    pns = np.zeros(ref_len, dtype=float)
-    pospns = np.zeros(ref_len, dtype=float)
+    dyad = np.zeros(ref_len, dtype=float)
+    pns = np.zeros(ref_len, dtype=float) if do_pns else None
+    pospns = np.zeros(ref_len, dtype=float) if do_pns else None
     fragment_ends = np.zeros(ref_len, dtype=int)
+    fragment_left_ends = np.zeros(ref_len, dtype=int)
+    fragment_right_ends = np.zeros(ref_len, dtype=int)
 
     # 1) Collect all fragments for this window (after filtering/subsampling/dup logic)
     fragments: List[Tuple[int, int]] = []
@@ -436,12 +444,18 @@ def score_contig(
     # 3) Score fragments
     for frag_start, frag_end in fragments:
         frag_length = frag_end - frag_start
-        pns_fragment_scores = pns_distributions.get(frag_length)
-        pospns_fragment_scores = pospns_distributions.get(frag_length)
 
-        # Add kernels if fragment length in allowed range
+        # Add PNS kernels if requested and fragment length is in allowed range
+        if do_pns:
+            pns_fragment_scores = pns_distributions.get(frag_length)
+            pospns_fragment_scores = pospns_distributions.get(frag_length)
+        else:
+            pns_fragment_scores = None
+            pospns_fragment_scores = None
+
         if (
-            frag_length in pns_frag_range
+            do_pns
+            and frag_length in pns_frag_range
             and pns_fragment_scores is not None
             and pospns_fragment_scores is not None
         ):
@@ -477,35 +491,61 @@ def score_contig(
                 coverage[frag_start - start : frag_end - start] += 1
 
                 # Dyad
-                fragment_center = frag_start + (frag_length // 2) - start
-                if 0 <= fragment_center < ref_len:
-                    dyad[fragment_center] += 1
+                if frag_length % 2 == 1:
+                    # Odd length: one true central base
+                    fragment_center = frag_start + (frag_length // 2) - start
+                    if 0 <= fragment_center < ref_len:
+                        dyad[fragment_center] += 1.0
+                else:
+                    # Even length: split between the two central bases
+                    left_center = frag_start + (frag_length // 2) - 1 - start
+                    right_center = frag_start + (frag_length // 2) - start
 
-                # Fragment ends (both ends)
+                    if 0 <= left_center < ref_len:
+                        dyad[left_center] += 0.5
+                    if 0 <= right_center < ref_len:
+                        dyad[right_center] += 0.5
+
+                # Fragment ends
+                # Coordinate convention:
+                #   - left end  = fragment start (0-based, inclusive)
+                #   - right end = fragment end - 1 (0-based, inclusive)
+                #
+                # fragment_ends is retained for legacy compatibility and is the
+                # sum of left + right end counts. The separate left/right tracks
+                # are useful when end polarity matters.
                 left_end = frag_start - start
                 right_end = frag_end - 1 - start
 
                 if 0 <= left_end < ref_len:
                     fragment_ends[left_end] += 1
+                    fragment_left_ends[left_end] += 1
                 if 0 <= right_end < ref_len:
                     fragment_ends[right_end] += 1
-
-    # 4) Smooth PNS
-    window_size = 21
-    polyorder = 2
-    if len(pns) >= window_size:
-        pns_smoothed = savgol_filter(pns, window_size, polyorder)
-    else:
-        pns_smoothed = pns.copy()
+                    fragment_right_ends[right_end] += 1
 
     scores = {
         "coverage": [(contig, start, coverage)],
-        "pns_smoothed": [(contig, start, pns_smoothed)],
-        "pns": [(contig, start, pns)],
-        "posPNS": [(contig, start, pospns)],
         "dyad": [(contig, start, dyad)],
         "fragment_ends": [(contig, start, fragment_ends)],
+        "fragment_left_ends": [(contig, start, fragment_left_ends)],
+        "fragment_right_ends": [(contig, start, fragment_right_ends)],
     }
+
+    # 4) Smooth PNS only when PNS scoring is enabled
+    if do_pns:
+        window_size = 21
+        polyorder = 2
+        if len(pns) >= window_size:
+            pns_smoothed = savgol_filter(pns, window_size, polyorder)
+        else:
+            pns_smoothed = pns.copy()
+
+        scores.update({
+            "pns_smoothed": [(contig, start, pns_smoothed)],
+            "pns": [(contig, start, pns)],
+            "posPNS": [(contig, start, pospns)],
+        })
 
     return scores, pns_frag_range, fragments
 
@@ -631,9 +671,9 @@ def write_bedgraph(scores, contigs, out_prefix, first_region=False):
 
 
 def _wig_val_to_str(track: str, v) -> str:
-    if track in ("coverage", "dyad", "fragment_ends"):
+    if track in ("coverage", "fragment_ends", "fragment_left_ends", "fragment_right_ends"):
         return str(int(v))
-    return f"{float(v):.6f}"
+    return f"{float(v):.1f}"
 
 
 def write_wig_gz_tracks(
@@ -660,7 +700,7 @@ def write_wig_gz_tracks(
         f = handles[track]
         arr = scores[track][0][2]
 
-        if track in ("dyad", "fragment_ends"):
+        if track in ("dyad", "fragment_ends", "fragment_left_ends", "fragment_right_ends"):
 
             last_chrom = write_wig_gz_tracks._last_varstep_chrom.get(track)
 
@@ -677,7 +717,7 @@ def write_wig_gz_tracks(
                 if value == 0:
                     continue
 
-                f.write(f"{pos + 1}\t{int(value)}\n")
+                f.write(f"{pos + 1}\t{_wig_val_to_str(track, value)}\n")
 
         else:
             wig_start_1based = original_start + 1
@@ -1021,6 +1061,17 @@ def main():
     )
 
     parser.add_argument(
+        "--pns-mode",
+        choices=["on", "off"],
+        default="on",
+        help=(
+            "Turn PNS scoring and PNS-based peak calling on or off. "
+            "Use '--pns-mode off' to compute only non-PNS tracks such as coverage, dyad, "
+            "fragment_ends, fragment_left_ends, and fragment_right_ends."
+        ),
+    )
+
+    parser.add_argument(
         "--score-format",
         choices=["bedgraph", "wiggz", "both", "none"],
         default="wiggz",
@@ -1029,10 +1080,19 @@ def main():
     parser.add_argument(
         "--score-tracks",
         nargs="*",
-        default=["coverage", "pns_smoothed", "pns", "posPNS", "dyad", "fragment_ends"],
+        default=[
+            "coverage",
+            "pns_smoothed",
+            "pns",
+            "posPNS",
+            "dyad",
+            "fragment_ends",
+            "fragment_left_ends",
+            "fragment_right_ends",
+        ],
         help=(
             "Which score tracks to output (space-separated). "
-            "Valid: coverage pns_smoothed pns posPNS dyad. "
+            "Valid: coverage pns_smoothed pns posPNS dyad fragment_ends fragment_left_ends fragment_right_ends. "
             "Use '--score-tracks none' or '--score-format none' to disable."
         ),
     )
@@ -1066,13 +1126,33 @@ def main():
 
     args = parser.parse_args()
 
-    valid_tracks = {"coverage", "pns_smoothed", "pns", "posPNS", "dyad", "fragment_ends"}
+    valid_tracks = {
+        "coverage",
+        "pns_smoothed",
+        "pns",
+        "posPNS",
+        "dyad",
+        "fragment_ends",
+        "fragment_left_ends",
+        "fragment_right_ends",
+    }
     if args.score_tracks and len(args.score_tracks) == 1 and args.score_tracks[0].lower() == "none":
         args.score_tracks = []
     else:
         bad = [t for t in args.score_tracks if t not in valid_tracks]
         if bad:
             parser.error(f"Unknown --score-tracks: {bad}. Valid: {sorted(valid_tracks)}")
+
+    pns_tracks = {"pns", "posPNS", "pns_smoothed"}
+    if args.pns_mode == "off":
+        requested_pns_tracks = [t for t in args.score_tracks if t in pns_tracks]
+        if requested_pns_tracks:
+            print(
+                "WARNING: --pns-mode off: removing PNS tracks from --score-tracks: "
+                + ", ".join(requested_pns_tracks),
+                file=sys.stderr,
+            )
+            args.score_tracks = [t for t in args.score_tracks if t not in pns_tracks]
 
     if args.seed is not None:
         random.seed(args.seed)
@@ -1152,11 +1232,15 @@ def main():
                 )
             )
 
-    # Precompute kernels
+    # Fragment length range is used for all fragment-derived tracks.
+    # PNS kernels are only precomputed when PNS mode is on.
     pns_frag_range = range(args.frag_lower, args.frag_upper + 1)
-    pns_distributions, pospns_distributions = precompute_distributions(
-        pns_frag_range, args.mode_length
-    )
+    if args.pns_mode == "on":
+        pns_distributions, pospns_distributions = precompute_distributions(
+            pns_frag_range, args.mode_length
+        )
+    else:
+        pns_distributions, pospns_distributions = {}, {}
 
     # Remove old outputs
     combined_bedgraph = f"{args.out_prefix}_combined_scores.bedGraph"
@@ -1174,6 +1258,9 @@ def main():
     if args.score_format in ("bedgraph", "both"):
         to_remove.append(combined_bedgraph)
 
+    # Always remove old peak BEDs for this prefix. When --pns-mode off, no new
+    # peak BEDs are written, so this prevents stale PNS peak files from a
+    # previous run being mistaken for current output.
     if args.peak_format == "rich":
         to_remove.extend([nucleosome_bed_rich, breakpoint_bed_rich])
     else:
@@ -1181,6 +1268,12 @@ def main():
 
     if args.score_format in ("wiggz", "both"):
         to_remove.extend(wig_paths)
+
+        # Also remove stale PNS wig outputs when PNS is disabled, even though
+        # those tracks have already been removed from args.score_tracks.
+        if args.pns_mode == "off":
+            for t in sorted({"pns", "posPNS", "pns_smoothed"}):
+                to_remove.append(f"{args.out_prefix}_{t}.wig.gz")
 
     for fname in to_remove:
         if os.path.exists(fname):
@@ -1212,6 +1305,7 @@ def main():
             pns_distributions=pns_distributions,
             pospns_distributions=pospns_distributions,
             subsample=args.subsample,
+            pns_mode=args.pns_mode,
             randomize_mode=args.randomize_mode,
             fasta=fasta,
             anchor_prob_start=args.anchor_prob_start,
@@ -1245,45 +1339,48 @@ def main():
 
             unique_bases_covered_by_used += int(covered.sum())
 
-        pns_smoothed_scores = scores["pns_smoothed"][0][2]
         coverage_scores = scores["coverage"][0][2]
 
-        # Nucleosome regions
-        call_and_write_peaks(
-            scores=pns_smoothed_scores,
-            coverage_scores=coverage_scores,
-            adjusted_start=adjusted_start,
-            original_start=original_start,
-            original_end=original_end,
-            contig=contig,
-            out_prefix=args.out_prefix,
-            first_region=first_region,
-            peak_type_label="_nucleosome_regions",
-            flip_scores=False,
-            peak_format=args.peak_format,
-            peak_score_scale=args.peak_score_scale,
-            min_region_length=args.min_region_length,
-            max_neg_run=args.max_neg_run,
-        )
+        # PNS-based peak calling is skipped entirely when --pns-mode off.
+        if args.pns_mode == "on":
+            pns_smoothed_scores = scores["pns_smoothed"][0][2]
 
-        # Breakpoint peaks (flip sign)
-        flipped_scores = -1 * pns_smoothed_scores
-        call_and_write_peaks(
-            scores=flipped_scores,
-            coverage_scores=coverage_scores,
-            adjusted_start=adjusted_start,
-            original_start=original_start,
-            original_end=original_end,
-            contig=contig,
-            out_prefix=args.out_prefix,
-            first_region=first_region,
-            peak_type_label="_breakpoint_peaks",
-            flip_scores=True,
-            peak_format=args.peak_format,
-            peak_score_scale=args.peak_score_scale,
-            min_region_length=args.min_region_length,
-            max_neg_run=args.max_neg_run,
-        )
+            # Nucleosome regions
+            call_and_write_peaks(
+                scores=pns_smoothed_scores,
+                coverage_scores=coverage_scores,
+                adjusted_start=adjusted_start,
+                original_start=original_start,
+                original_end=original_end,
+                contig=contig,
+                out_prefix=args.out_prefix,
+                first_region=first_region,
+                peak_type_label="_nucleosome_regions",
+                flip_scores=False,
+                peak_format=args.peak_format,
+                peak_score_scale=args.peak_score_scale,
+                min_region_length=args.min_region_length,
+                max_neg_run=args.max_neg_run,
+            )
+
+            # Breakpoint peaks (flip sign)
+            flipped_scores = -1 * pns_smoothed_scores
+            call_and_write_peaks(
+                scores=flipped_scores,
+                coverage_scores=coverage_scores,
+                adjusted_start=adjusted_start,
+                original_start=original_start,
+                original_end=original_end,
+                contig=contig,
+                out_prefix=args.out_prefix,
+                first_region=first_region,
+                peak_type_label="_breakpoint_peaks",
+                flip_scores=True,
+                peak_format=args.peak_format,
+                peak_score_scale=args.peak_score_scale,
+                min_region_length=args.min_region_length,
+                max_neg_run=args.max_neg_run,
+            )
 
         # Per-base scores, trimmed to non-overlap region
         if args.score_format in ("bedgraph", "both"):
