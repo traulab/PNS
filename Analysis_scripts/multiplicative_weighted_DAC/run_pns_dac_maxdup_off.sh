@@ -267,7 +267,7 @@ done |
       --frag-lower "$FRAG_LOWER" \
       --frag-upper "$FRAG_UPPER" \
       -c "$target" \
-      --max-duplicates 1 \
+      --max-duplicates 0 \
       -o "$out" \
       --pns-mode off \
       --score-format wiggz \

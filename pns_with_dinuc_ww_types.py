@@ -17,7 +17,10 @@ What this script does (high level):
    - positive peaks ("nucleosome regions") on smoothed PNS
    - negative peaks ("breakpoint peaks") by flipping the PNS sign and re-calling
    Use --pns-mode off to skip PNS scoring, smoothing, and peak calling.
-7) Writes (configurable):
+7) Optionally calculates pure observed dinucleotide profiles aligned to dyad 0.
+8) Optionally classifies fragments into WW/SS Types 1-4 from a centred 147-bp core
+   and writes separate outputs for each type plus the legacy all-fragment outputs.
+9) Writes (configurable):
    - bedGraph (combined multi-track bedGraph; legacy behavior)
    - wig.gz (one file per track; fixedStep)
    - a BED file of nucleosome peaks
@@ -46,6 +49,308 @@ import random
 from typing import Dict, List, Optional, Tuple
 
 DINUCS = [a + b for a in "ACGT" for b in "ACGT"]
+WW_DINUCS = {"AA", "AT", "TA", "TT"}
+SS_DINUCS = {"CC", "CG", "GC", "GG"}
+VALID_BASES = {"A", "C", "G", "T"}
+WW_TYPE_GROUPS = ("type1", "type2", "type3", "type4")
+ALL_OUTPUT_GROUPS = ("all",) + WW_TYPE_GROUPS
+WW_MAJOR_SITE_COEFFICIENT = 36.0 / 32.0  # 1.125
+
+# Base positions relative to the dyad (dyad = 0), copied from Supplementary
+# Table S1. Each tuple is an inclusive range of bases belonging to one
+# minor- or major-groove bending site. The SHL +/-0.5 sites are excluded,
+# following the paper.
+MINOR_GBS_RELATIVE = (
+    (-69, -66),
+    (-59, -56),
+    (-48, -45),
+    (-37, -34),
+    (-27, -24),
+    (-17, -14),
+    (14, 17),
+    (24, 27),
+    (34, 37),
+    (45, 48),
+    (56, 59),
+    (66, 69),
+)
+
+MAJOR_GBS_RELATIVE = (
+    (-64, -61),
+    (-53, -51),
+    (-42, -40),
+    (-32, -29),
+    (-22, -19),
+    (-12, -9),
+    (9, 12),
+    (19, 22),
+    (29, 32),
+    (40, 42),
+    (51, 53),
+    (61, 64),
+)
+
+
+def _dinuc_starts_from_base_ranges(base_ranges):
+    """Convert inclusive base ranges into relative dinucleotide-start sites."""
+    return tuple(
+        pos
+        for site_start, site_end in base_ranges
+        for pos in range(site_start, site_end)
+    )
+
+
+MINOR_GBS_DINUC_STARTS = _dinuc_starts_from_base_ranges(MINOR_GBS_RELATIVE)
+MAJOR_GBS_DINUC_STARTS = _dinuc_starts_from_base_ranges(MAJOR_GBS_RELATIVE)
+
+if len(MINOR_GBS_DINUC_STARTS) != 36:
+    raise RuntimeError("Expected 36 minor-groove dinucleotide positions.")
+if len(MAJOR_GBS_DINUC_STARTS) != 32:
+    raise RuntimeError("Expected 32 major-groove dinucleotide positions.")
+
+
+def fragment_dyad(frag_start: int, frag_end: int) -> int:
+    """
+    Return the dyad base used for sequence alignment and WW-type assignment.
+
+    Odd fragments use their true central base. For even fragments, this uses
+    the right-hand central base, as requested:
+        dyad = frag_start + floor(fragment_length / 2)
+    """
+    return frag_start + ((frag_end - frag_start) // 2)
+
+
+def group_output_prefix(out_prefix: str, group: str) -> str:
+    """Keep legacy unsuffixed output names for 'all'; suffix type-specific files."""
+    if group == "all":
+        return out_prefix
+    return f"{out_prefix}_{group}"
+
+
+def prepare_reference_context(
+    fasta: pysam.FastaFile,
+    contig: str,
+    start: int,
+    end: int,
+):
+    """Fetch one reference window and retain metadata for fast fragment slicing."""
+    fasta_contig = resolve_fasta_contig(fasta, contig)
+    fasta_length = fasta.get_reference_length(fasta_contig)
+    seq = fasta.fetch(fasta_contig, start, end).upper()
+    expected = end - start
+    if len(seq) != expected:
+        seq = seq[:expected].ljust(expected, "N")
+    return {
+        "contig": fasta_contig,
+        "length": fasta_length,
+        "start": start,
+        "end": end,
+        "seq": seq,
+    }
+
+
+def extract_reference_sequence(
+    fasta: pysam.FastaFile,
+    reference_context,
+    seq_start: int,
+    seq_end: int,
+) -> Optional[str]:
+    """Return an uppercase reference sequence or None when outside the contig."""
+    if seq_start < 0 or seq_end <= seq_start:
+        return None
+    if seq_end > reference_context["length"]:
+        return None
+
+    window_start = reference_context["start"]
+    window_end = reference_context["end"]
+    if seq_start >= window_start and seq_end <= window_end:
+        rel_start = seq_start - window_start
+        rel_end = seq_end - window_start
+        seq = reference_context["seq"][rel_start:rel_end]
+    else:
+        seq = fasta.fetch(reference_context["contig"], seq_start, seq_end).upper()
+
+    if len(seq) != seq_end - seq_start:
+        return None
+    return seq
+
+
+def sequence_is_acgt(seq: str) -> bool:
+    return bool(seq) and all(base in VALID_BASES for base in seq)
+
+
+def count_ww_ss_at_relative_sites(core_seq: str, relative_starts) -> Tuple[int, int]:
+    """
+    Count WW and SS dinucleotides at selected sites in a centred 147-bp core.
+
+    core_seq[73] is the dyad base (relative position 0), so a relative
+    dinucleotide start p maps to core_seq[p + 73 : p + 75].
+    """
+    ww = 0
+    ss = 0
+    for rel_start in relative_starts:
+        i = rel_start + 73
+        dinuc = core_seq[i : i + 2]
+        if dinuc in WW_DINUCS:
+            ww += 1
+        elif dinuc in SS_DINUCS:
+            ss += 1
+    return ww, ss
+
+
+def classify_fragment_ww_type(
+    fasta: pysam.FastaFile,
+    reference_context,
+    frag_start: int,
+    frag_end: int,
+) -> Optional[str]:
+    """
+    Classify a fragment as WW/SS Type 1-4 using a centred 147-bp sequence.
+
+    Every observed fragment length uses the same 147-bp reference template:
+      core_start = dyad - 73
+      core_end   = dyad + 74
+
+    Returns None when the core crosses a reference boundary or contains a base
+    other than A/C/G/T.
+    """
+    dyad = fragment_dyad(frag_start, frag_end)
+    core_seq = extract_reference_sequence(
+        fasta=fasta,
+        reference_context=reference_context,
+        seq_start=dyad - 73,
+        seq_end=dyad + 74,
+    )
+    if core_seq is None or len(core_seq) != 147 or not sequence_is_acgt(core_seq):
+        return None
+
+    minor_ww, minor_ss = count_ww_ss_at_relative_sites(
+        core_seq, MINOR_GBS_DINUC_STARTS
+    )
+    major_ww, major_ss = count_ww_ss_at_relative_sites(
+        core_seq, MAJOR_GBS_DINUC_STARTS
+    )
+
+    ww_minor_enriched = minor_ww >= (major_ww * WW_MAJOR_SITE_COEFFICIENT)
+    ss_minor_enriched = minor_ss > (major_ss * WW_MAJOR_SITE_COEFFICIENT)
+
+    if ww_minor_enriched and not ss_minor_enriched:
+        return "type1"
+    if ww_minor_enriched and ss_minor_enriched:
+        return "type2"
+    if not ww_minor_enriched and not ss_minor_enriched:
+        return "type3"
+    return "type4"
+
+
+def expected_dinuc_profile_positions(frag_lower: int, frag_upper: int) -> List[int]:
+    """Return all possible dyad-relative dinucleotide-start positions in the range."""
+    positions = set()
+    for frag_length in range(frag_lower, frag_upper + 1):
+        dyad_offset = frag_length // 2
+        for i in range(frag_length - 1):
+            positions.add(i - dyad_offset)
+    return sorted(positions)
+
+
+def new_dinuc_accumulator():
+    return {
+        "counts": defaultdict(Counter),
+        "n_valid": Counter(),
+        "fragments_used": 0,
+        "fragments_skipped": 0,
+    }
+
+
+def add_fragment_to_dinuc_accumulator(
+    accumulator,
+    fragment_seq: Optional[str],
+    frag_start: int,
+    frag_end: int,
+) -> bool:
+    """Add a pure observed 16-dinucleotide profile aligned to dyad position 0."""
+    if fragment_seq is None or len(fragment_seq) != frag_end - frag_start:
+        accumulator["fragments_skipped"] += 1
+        return False
+    if not sequence_is_acgt(fragment_seq):
+        accumulator["fragments_skipped"] += 1
+        return False
+
+    dyad = fragment_dyad(frag_start, frag_end)
+    for i in range(len(fragment_seq) - 1):
+        dinuc = fragment_seq[i : i + 2]
+        rel_pos = (frag_start + i) - dyad
+        accumulator["counts"][rel_pos][dinuc] += 1
+        accumulator["n_valid"][rel_pos] += 1
+
+    accumulator["fragments_used"] += 1
+    return True
+
+
+def write_dinuc_profile(
+    out_path: str,
+    accumulator,
+    positions: List[int],
+    fraction: bool = False,
+):
+    """Write pure observed dinucleotide fractions or percentages."""
+    multiplier = 1.0 if fraction else 100.0
+    suffix = "frac" if fraction else "pct"
+
+    header = ["position", "n_valid"]
+    header.extend([f"{dinuc}_{suffix}" for dinuc in DINUCS])
+    header.extend([f"WW_{suffix}", f"SS_{suffix}"])
+
+    with open(out_path, "w") as out:
+        out.write("\t".join(header) + "\n")
+        for rel_pos in positions:
+            n_valid = int(accumulator["n_valid"].get(rel_pos, 0))
+            counts = accumulator["counts"].get(rel_pos, Counter())
+            row = [str(rel_pos), str(n_valid)]
+
+            if n_valid == 0:
+                row.extend(["NaN"] * (len(DINUCS) + 2))
+            else:
+                for dinuc in DINUCS:
+                    row.append(f"{(counts[dinuc] / n_valid) * multiplier:.8g}")
+                ww_count = sum(counts[d] for d in WW_DINUCS)
+                ss_count = sum(counts[d] for d in SS_DINUCS)
+                row.append(f"{(ww_count / n_valid) * multiplier:.8g}")
+                row.append(f"{(ss_count / n_valid) * multiplier:.8g}")
+
+            out.write("\t".join(row) + "\n")
+
+
+def write_ww_type_summary(
+    out_prefix: str,
+    type_counts: Counter,
+    total_in_range: int,
+):
+    """Write counts and percentages for Type 1-4 and unclassified fragments."""
+    path = f"{out_prefix}_ww_type_summary.tsv"
+    classified_total = sum(type_counts[t] for t in WW_TYPE_GROUPS)
+
+    with open(path, "w") as out:
+        out.write(
+            "type\tfragment_count\tpercent_of_all_in_range"
+            "\tpercent_of_classified\n"
+        )
+        for group in WW_TYPE_GROUPS:
+            count = int(type_counts[group])
+            pct_all = (100.0 * count / total_in_range) if total_in_range else float("nan")
+            pct_classified = (
+                100.0 * count / classified_total if classified_total else float("nan")
+            )
+            out.write(
+                f"{group}\t{count}\t{pct_all:.8g}\t{pct_classified:.8g}\n"
+            )
+
+        unclassified = int(type_counts["unclassified"])
+        pct_all = (
+            100.0 * unclassified / total_in_range if total_in_range else float("nan")
+        )
+        out.write(f"unclassified\t{unclassified}\t{pct_all:.8g}\tNaN\n")
+        out.write(f"all\t{int(total_in_range)}\t100\tNaN\n")
 
 
 def resolve_fasta_contig(fasta: pysam.FastaFile, contig: str) -> str:
@@ -381,6 +686,129 @@ def dinuc_anchor_randomize_fragments(
     return randomized
 
 
+def _new_track_arrays(ref_len: int, do_pns: bool):
+    arrays = {
+        "coverage": np.zeros(ref_len, dtype=int),
+        "dyad": np.zeros(ref_len, dtype=float),
+        "fragment_ends": np.zeros(ref_len, dtype=int),
+        "fragment_left_ends": np.zeros(ref_len, dtype=int),
+        "fragment_right_ends": np.zeros(ref_len, dtype=int),
+    }
+    if do_pns:
+        arrays["pns"] = np.zeros(ref_len, dtype=float)
+        arrays["posPNS"] = np.zeros(ref_len, dtype=float)
+    return arrays
+
+
+def _add_fragment_to_track_arrays(
+    arrays,
+    frag_start: int,
+    frag_end: int,
+    window_start: int,
+    window_end: int,
+    mode_DNA_length: int,
+    pns_frag_range,
+    pns_distributions,
+    pospns_distributions,
+    do_pns: bool,
+):
+    """Add one fragment to one output group's PNS/coverage/dyad/end arrays."""
+    frag_length = frag_end - frag_start
+    if frag_length not in pns_frag_range:
+        return
+
+    ref_len = window_end - window_start
+
+    if do_pns:
+        pns_fragment_scores = pns_distributions.get(frag_length)
+        pospns_fragment_scores = pospns_distributions.get(frag_length)
+
+        if pns_fragment_scores is not None and pospns_fragment_scores is not None:
+            if frag_length < mode_DNA_length:
+                total_length = mode_DNA_length + (mode_DNA_length - frag_length)
+                centre = fragment_dyad(frag_start, frag_end) - window_start
+                start_pos = centre - (total_length // 2)
+                end_pos = start_pos + total_length
+            else:
+                start_pos = frag_start - window_start
+                end_pos = frag_end - window_start
+
+            pns_scores_to_add = np.asarray(pns_fragment_scores, dtype=float)
+            pospns_scores_to_add = np.asarray(pospns_fragment_scores, dtype=float)
+
+            if start_pos < 0:
+                pns_scores_to_add = pns_scores_to_add[-start_pos:]
+                pospns_scores_to_add = pospns_scores_to_add[-start_pos:]
+                start_pos = 0
+            if end_pos > ref_len:
+                trim_len = max(0, ref_len - start_pos)
+                pns_scores_to_add = pns_scores_to_add[:trim_len]
+                pospns_scores_to_add = pospns_scores_to_add[:trim_len]
+
+            if 0 <= start_pos < ref_len and len(pns_scores_to_add) > 0:
+                arrays["pns"][start_pos : start_pos + len(pns_scores_to_add)] += (
+                    pns_scores_to_add
+                )
+                arrays["posPNS"][start_pos : start_pos + len(pospns_scores_to_add)] += (
+                    pospns_scores_to_add
+                )
+
+    # Preserve the original behavior: coverage, dyad, and end tracks require
+    # the complete fragment to lie inside the adjusted scoring window.
+    if frag_start < window_start or frag_end > window_end:
+        return
+
+    left = frag_start - window_start
+    right = frag_end - window_start
+    arrays["coverage"][left:right] += 1
+
+    if frag_length % 2 == 1:
+        centre = fragment_dyad(frag_start, frag_end) - window_start
+        if 0 <= centre < ref_len:
+            arrays["dyad"][centre] += 1.0
+    else:
+        right_centre = fragment_dyad(frag_start, frag_end) - window_start
+        left_centre = right_centre - 1
+        if 0 <= left_centre < ref_len:
+            arrays["dyad"][left_centre] += 0.5
+        if 0 <= right_centre < ref_len:
+            arrays["dyad"][right_centre] += 0.5
+
+    left_end = frag_start - window_start
+    right_end = frag_end - 1 - window_start
+    if 0 <= left_end < ref_len:
+        arrays["fragment_ends"][left_end] += 1
+        arrays["fragment_left_ends"][left_end] += 1
+    if 0 <= right_end < ref_len:
+        arrays["fragment_ends"][right_end] += 1
+        arrays["fragment_right_ends"][right_end] += 1
+
+
+def _arrays_to_scores(arrays, contig: str, start: int, do_pns: bool):
+    scores = {
+        "coverage": [(contig, start, arrays["coverage"])],
+        "dyad": [(contig, start, arrays["dyad"])],
+        "fragment_ends": [(contig, start, arrays["fragment_ends"])],
+        "fragment_left_ends": [(contig, start, arrays["fragment_left_ends"])],
+        "fragment_right_ends": [(contig, start, arrays["fragment_right_ends"])],
+    }
+
+    if do_pns:
+        pns = arrays["pns"]
+        if len(pns) >= 21:
+            pns_smoothed = savgol_filter(pns, 21, 2)
+        else:
+            pns_smoothed = pns.copy()
+        scores.update(
+            {
+                "pns_smoothed": [(contig, start, pns_smoothed)],
+                "pns": [(contig, start, pns)],
+                "posPNS": [(contig, start, arrays["posPNS"])],
+            }
+        )
+    return scores
+
+
 def score_contig(
     bamfiles,
     contig,
@@ -399,176 +827,115 @@ def score_contig(
     max_anchor_tries: int = 30,
     randomize_fallback: str = "uniform",  # uniform|keep|skip
     dedup_scope: str = "all_bams",  # all_bams|per_bam
+    split_ww_types: bool = False,
+    need_reference_sequence: bool = False,
 ):
     """
-    Score a genomic interval [start, end) on one contig.
+    Score one adjusted genomic window and optionally split fragments by WW type.
 
-    Randomization (within this window) is applied BEFORE scoring if requested.
-
-    If pns_mode == "off", only non-PNS tracks are computed; PNS kernels,
-    smoothing, and PNS-derived peak calling are skipped by main().
+    Fragment type assignment uses a centred 147-bp reference sequence around
+    dyad position 0, regardless of observed fragment length. Randomization is
+    applied before sequence profiling and type assignment.
 
     Returns:
-      scores, pns_frag_range, fragments_filtered
-        Fragments remaining after read filtering, optional subsampling,
-        coordinate-based deduplication, and optional randomization.
+      scores_by_group:
+        'all' always, plus type1-type4 when split_ww_types=True.
+      pns_frag_range
+      fragment_records:
+        (frag_start, frag_end, ww_type_or_None) after all filtering and optional
+        randomization.
+      reference_context:
+        cached FASTA window metadata when sequence access was requested.
     """
-    do_pns = (pns_mode == "on")
+    do_pns = pns_mode == "on"
     ref_len = end - start
-    coverage = np.zeros(ref_len, dtype=int)
-    dyad = np.zeros(ref_len, dtype=float)
-    pns = np.zeros(ref_len, dtype=float) if do_pns else None
-    pospns = np.zeros(ref_len, dtype=float) if do_pns else None
-    fragment_ends = np.zeros(ref_len, dtype=int)
-    fragment_left_ends = np.zeros(ref_len, dtype=int)
-    fragment_right_ends = np.zeros(ref_len, dtype=int)
+    groups = ALL_OUTPUT_GROUPS if split_ww_types else ("all",)
+    arrays_by_group = {
+        group: _new_track_arrays(ref_len, do_pns) for group in groups
+    }
 
-    # 1) Collect fragments after read filtering, coordinate-based deduplication,
-    #    and optional subsampling.
     fragments: List[Tuple[int, int]] = []
     shared_frag_counts = defaultdict(int) if dedup_scope == "all_bams" else None
 
     for bamfile in bamfiles:
-        # all_bams: every BAM contributes to the same coordinate-count table.
-        # per_bam: generate_paired_reads creates a new table for each BAM.
         bam_frag_counts = shared_frag_counts if dedup_scope == "all_bams" else None
         for frag_start, frag_end in generate_fragment_ranges(
             bamfile, contig, start, end, max_duplicates, subsample, bam_frag_counts
         ):
             fragments.append((frag_start, frag_end))
 
-    # 2) Randomize fragments if requested
+    reference_context = None
+    if need_reference_sequence:
+        if fasta is None:
+            raise ValueError("Reference-sequence processing requires --fasta")
+        reference_context = prepare_reference_context(fasta, contig, start, end)
+
     if randomize_mode == "uniform" and fragments:
         fragments = uniform_randomize_fragments(fragments, start, end)
 
     elif randomize_mode == "dinuc_anchor" and fragments:
-        if fasta is None:
+        if fasta is None or reference_context is None:
             raise ValueError("randomize_mode=dinuc_anchor requires --fasta")
-        fasta_contig = resolve_fasta_contig(fasta, contig)
-        window_seq = fasta.fetch(fasta_contig, start, end).upper()
-        if len(window_seq) != ref_len:
-            window_seq = window_seq[:ref_len].ljust(ref_len, "N")
-        dinuc_pos = build_dinuc_index(window_seq)
-
+        dinuc_pos = build_dinuc_index(reference_context["seq"])
         fragments = dinuc_anchor_randomize_fragments(
             fragments=fragments,
             start=start,
             end=end,
-            window_seq=window_seq,
+            window_seq=reference_context["seq"],
             dinuc_pos=dinuc_pos,
             anchor_prob_start=anchor_prob_start,
             max_anchor_tries=max_anchor_tries,
             fallback=randomize_fallback,
         )
 
-    # 3) Score fragments
+    fragment_records = []
     for frag_start, frag_end in fragments:
         frag_length = frag_end - frag_start
+        ww_type = None
 
-        # Add PNS kernels if requested and fragment length is in allowed range
-        if do_pns:
-            pns_fragment_scores = pns_distributions.get(frag_length)
-            pospns_fragment_scores = pospns_distributions.get(frag_length)
-        else:
-            pns_fragment_scores = None
-            pospns_fragment_scores = None
+        if split_ww_types and frag_length in pns_frag_range:
+            ww_type = classify_fragment_ww_type(
+                fasta=fasta,
+                reference_context=reference_context,
+                frag_start=frag_start,
+                frag_end=frag_end,
+            )
 
-        if (
-            do_pns
-            and frag_length in pns_frag_range
-            and pns_fragment_scores is not None
-            and pospns_fragment_scores is not None
-        ):
+        fragment_records.append((frag_start, frag_end, ww_type))
 
-            if frag_length < mode_DNA_length:
-                total_length = mode_DNA_length + (mode_DNA_length - frag_length)
-                fragment_center = frag_start + (frag_length // 2) - start
-                start_pos = fragment_center - (total_length // 2)
-                end_pos = start_pos + total_length
-            else:
-                start_pos = frag_start - start
-                end_pos = frag_end - start
+        _add_fragment_to_track_arrays(
+            arrays=arrays_by_group["all"],
+            frag_start=frag_start,
+            frag_end=frag_end,
+            window_start=start,
+            window_end=end,
+            mode_DNA_length=mode_DNA_length,
+            pns_frag_range=pns_frag_range,
+            pns_distributions=pns_distributions,
+            pospns_distributions=pospns_distributions,
+            do_pns=do_pns,
+        )
 
-            pns_scores_to_add = np.array(pns_fragment_scores, dtype=float)
-            pospns_scores_to_add = np.array(pospns_fragment_scores, dtype=float)
+        if split_ww_types and ww_type in WW_TYPE_GROUPS:
+            _add_fragment_to_track_arrays(
+                arrays=arrays_by_group[ww_type],
+                frag_start=frag_start,
+                frag_end=frag_end,
+                window_start=start,
+                window_end=end,
+                mode_DNA_length=mode_DNA_length,
+                pns_frag_range=pns_frag_range,
+                pns_distributions=pns_distributions,
+                pospns_distributions=pospns_distributions,
+                do_pns=do_pns,
+            )
 
-            if start_pos < 0:
-                pns_scores_to_add = pns_scores_to_add[-start_pos:]
-                pospns_scores_to_add = pospns_scores_to_add[-start_pos:]
-                start_pos = 0
-            if end_pos > ref_len:
-                trim_len = ref_len - start_pos
-                pns_scores_to_add = pns_scores_to_add[:trim_len]
-                pospns_scores_to_add = pospns_scores_to_add[:trim_len]
-
-            if 0 <= start_pos < ref_len:
-                pns[start_pos : start_pos + len(pns_scores_to_add)] += pns_scores_to_add
-                pospns[start_pos : start_pos + len(pospns_scores_to_add)] += pospns_scores_to_add
-
-        # Coverage, dyad, and fragment ends
-        if frag_start >= start and frag_end <= end:
-            if frag_length in pns_frag_range:
-                coverage[frag_start - start : frag_end - start] += 1
-
-                # Dyad
-                if frag_length % 2 == 1:
-                    # Odd length: one true central base
-                    fragment_center = frag_start + (frag_length // 2) - start
-                    if 0 <= fragment_center < ref_len:
-                        dyad[fragment_center] += 1.0
-                else:
-                    # Even length: split between the two central bases
-                    left_center = frag_start + (frag_length // 2) - 1 - start
-                    right_center = frag_start + (frag_length // 2) - start
-
-                    if 0 <= left_center < ref_len:
-                        dyad[left_center] += 0.5
-                    if 0 <= right_center < ref_len:
-                        dyad[right_center] += 0.5
-
-                # Fragment ends
-                # Coordinate convention:
-                #   - left end  = fragment start (0-based, inclusive)
-                #   - right end = fragment end - 1 (0-based, inclusive)
-                #
-                # fragment_ends is retained for legacy compatibility and is the
-                # sum of left + right end counts. The separate left/right tracks
-                # are useful when end polarity matters.
-                left_end = frag_start - start
-                right_end = frag_end - 1 - start
-
-                if 0 <= left_end < ref_len:
-                    fragment_ends[left_end] += 1
-                    fragment_left_ends[left_end] += 1
-                if 0 <= right_end < ref_len:
-                    fragment_ends[right_end] += 1
-                    fragment_right_ends[right_end] += 1
-
-    scores = {
-        "coverage": [(contig, start, coverage)],
-        "dyad": [(contig, start, dyad)],
-        "fragment_ends": [(contig, start, fragment_ends)],
-        "fragment_left_ends": [(contig, start, fragment_left_ends)],
-        "fragment_right_ends": [(contig, start, fragment_right_ends)],
+    scores_by_group = {
+        group: _arrays_to_scores(arrays, contig, start, do_pns)
+        for group, arrays in arrays_by_group.items()
     }
 
-    # 4) Smooth PNS only when PNS scoring is enabled
-    if do_pns:
-        window_size = 21
-        polyorder = 2
-        if len(pns) >= window_size:
-            pns_smoothed = savgol_filter(pns, window_size, polyorder)
-        else:
-            pns_smoothed = pns.copy()
-
-        scores.update({
-            "pns_smoothed": [(contig, start, pns_smoothed)],
-            "pns": [(contig, start, pns)],
-            "posPNS": [(contig, start, pospns)],
-        })
-
-    return scores, pns_frag_range, fragments
-
+    return scores_by_group, pns_frag_range, fragment_records, reference_context
 
 def find_peaks_and_regions(scores, original_start, min_length, max_neg_run):
     positive_regions = []
@@ -722,11 +1089,12 @@ def write_wig_gz_tracks(
 
         if track in ("dyad", "fragment_ends", "fragment_left_ends", "fragment_right_ends"):
 
-            last_chrom = write_wig_gz_tracks._last_varstep_chrom.get(track)
+            state_key = (track, getattr(f, "name", id(f)))
+            last_chrom = write_wig_gz_tracks._last_varstep_chrom.get(state_key)
 
             if last_chrom != chrom:
                 f.write(f"variableStep chrom={chrom}\n")
-                write_wig_gz_tracks._last_varstep_chrom[track] = chrom
+                write_wig_gz_tracks._last_varstep_chrom[state_key] = chrom
 
             for pos in range(original_start, original_end):
                 i = pos - adjusted_start
@@ -1040,7 +1408,12 @@ def write_fragment_outputs(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Score fragmentomics data.")
+    parser = argparse.ArgumentParser(
+        description=(
+            "Score fragmentomics data, optionally output pure observed "
+            "dinucleotide profiles and split fragments into WW/SS Types 1-4."
+        )
+    )
     parser.add_argument("-b", "--bamfiles", nargs="+", required=True, help="BAM file(s) to process")
     parser.add_argument("-o", "--out_prefix", help="prefix for output files (default: based on BAM names and contigs)")
     parser.add_argument("-c", "--contigs", nargs="+", help='limit to contig(s) and optional range, e.g. "2:100000-200000"')
@@ -1073,7 +1446,6 @@ def main():
     parser.add_argument("--subsample", type=float, default=None, help="Subsampling proportion (e.g., 0.5 to subsample 50%% of the reads)")
     parser.add_argument("--seed", type=int, default=None, help="Random seed (for reproducibility)")
 
-    # Randomization controls
     parser.add_argument(
         "--randomize-mode",
         choices=["none", "uniform", "dinuc_anchor"],
@@ -1083,7 +1455,10 @@ def main():
     parser.add_argument(
         "--fasta",
         default=None,
-        help="Reference FASTA (required for --randomize-mode dinuc_anchor). Needs .fai index.",
+        help=(
+            "Reference FASTA with .fai index. Required for dinuc_anchor, "
+            "--dinuc-profile, and --split-ww-types."
+        ),
     )
     parser.add_argument(
         "--anchor-prob-start",
@@ -1105,6 +1480,35 @@ def main():
     )
 
     parser.add_argument(
+        "--dinuc-profile",
+        action="store_true",
+        help=(
+            "Output a pure observed 16-dinucleotide profile for the same in-range "
+            "fragments used by the PNS/coverage/dyad tracks. Fragment sequences are "
+            "aligned so dyad position is 0. Requires --fasta."
+        ),
+    )
+    parser.add_argument(
+        "--dinuc-fraction",
+        action="store_true",
+        help=(
+            "With --dinuc-profile, output fractions from 0 to 1 instead of the "
+            "default percentages from 0 to 100."
+        ),
+    )
+    parser.add_argument(
+        "--split-ww-types",
+        action="store_true",
+        help=(
+            "Classify each in-range fragment as WW/SS type1-type4 using a centred "
+            "147-bp reference sequence around dyad 0, then write separate PNS, dyad, "
+            "coverage, fragment-end, peak, summary, and optional dinucleotide files "
+            "for type1-type4 while retaining the legacy unsuffixed 'all' outputs. "
+            "Requires --fasta."
+        ),
+    )
+
+    parser.add_argument(
         "--pns-mode",
         choices=["on", "off"],
         default="on",
@@ -1114,7 +1518,6 @@ def main():
             "fragment_ends, fragment_left_ends, and fragment_right_ends."
         ),
     )
-
     parser.add_argument(
         "--score-format",
         choices=["bedgraph", "wiggz", "both", "none"],
@@ -1135,17 +1538,17 @@ def main():
             "fragment_right_ends",
         ],
         help=(
-            "Which score tracks to output (space-separated). "
-            "Valid: coverage pns_smoothed pns posPNS dyad fragment_ends fragment_left_ends fragment_right_ends. "
-            "Use '--score-tracks none' or '--score-format none' to disable."
+            "Which score tracks to output (space-separated). Valid: coverage "
+            "pns_smoothed pns posPNS dyad fragment_ends fragment_left_ends "
+            "fragment_right_ends. Use '--score-tracks none' or '--score-format none' "
+            "to disable."
         ),
     )
-
     parser.add_argument(
         "--peak-format",
         choices=["rich", "bed8"],
         default="bed8",
-        help="Peak BED8 output format.",
+        help="Peak output format.",
     )
     parser.add_argument(
         "--peak-score-scale",
@@ -1153,25 +1556,31 @@ def main():
         default=1.0,
         help="Only for --peak-format bed8: score = round(prominence * scale) written as int.",
     )
-
     parser.add_argument(
         "--min-region-length",
         type=int,
         default=50,
-        help="Minimum length (bp) of positive regions"
+        help="Minimum length (bp) of positive regions",
     )
-
     parser.add_argument(
         "--max-neg-run",
         type=int,
         default=5,
-        help="Maximum consecutive non-positive bases allowed within a positive region"
+        help="Maximum consecutive non-positive bases allowed within a positive region",
     )
 
     args = parser.parse_args()
 
     if args.max_duplicates < 0:
         parser.error("--max-per-coordinate/--max-duplicates must be 0 or greater.")
+    if args.frag_lower < 1 or args.frag_upper < args.frag_lower:
+        parser.error("Require 1 <= --frag-lower <= --frag-upper.")
+    if args.dinuc_profile and args.frag_lower < 2:
+        parser.error("--dinuc-profile requires --frag-lower >= 2.")
+    if args.subsample is not None and not (0.0 <= args.subsample <= 1.0):
+        parser.error("--subsample must be between 0 and 1.")
+    if not (0.0 <= args.anchor_prob_start <= 1.0):
+        parser.error("--anchor-prob-start must be between 0 and 1.")
 
     valid_tracks = {
         "coverage",
@@ -1201,86 +1610,101 @@ def main():
             )
             args.score_tracks = [t for t in args.score_tracks if t not in pns_tracks]
 
+    if args.dinuc_fraction and not args.dinuc_profile:
+        parser.error("--dinuc-fraction requires --dinuc-profile.")
+
+    reference_required = (
+        args.randomize_mode == "dinuc_anchor"
+        or args.dinuc_profile
+        or args.split_ww_types
+    )
+    if reference_required and not args.fasta:
+        parser.error(
+            "--fasta <ref.fa> is required for dinuc_anchor, --dinuc-profile, "
+            "or --split-ww-types."
+        )
+
     if args.seed is not None:
         random.seed(args.seed)
         np.random.seed(args.seed)
 
     require_bam_indexes(args.bamfiles, parser=parser)
 
-    if args.randomize_mode == "dinuc_anchor" and not args.fasta:
-        parser.error("--randomize-mode dinuc_anchor requires --fasta <ref.fa> (with .fai index).")
-
     if not args.out_prefix:
         bam_basenames = [os.path.splitext(os.path.basename(bam))[0] for bam in args.bamfiles]
-        args.out_prefix = f"{'_'.join(bam_basenames)}"
+        args.out_prefix = "_".join(bam_basenames)
         if args.contigs and len(args.contigs) == 1:
             safe_contig = args.contigs[0].replace(":", "_")
             args.out_prefix = f"{args.out_prefix}_{safe_contig}"
 
-    args.out_prefix = f"{args.out_prefix}_mode{args.mode_length}_lower{args.frag_lower}_upper{args.frag_upper}"
+    args.out_prefix = (
+        f"{args.out_prefix}_mode{args.mode_length}_lower{args.frag_lower}"
+        f"_upper{args.frag_upper}"
+    )
+    out_parent = os.path.dirname(os.path.abspath(args.out_prefix))
+    if out_parent:
+        os.makedirs(out_parent, exist_ok=True)
 
-    # Open BAMs
     bamfiles = []
     for bamfile_path in args.bamfiles:
         try:
-            bamfile = pysam.AlignmentFile(bamfile_path, "rb")
-            bamfiles.append(bamfile)
+            bamfiles.append(pysam.AlignmentFile(bamfile_path, "rb"))
         except FileNotFoundError:
             parser.error(f"Unable to open bamfile {bamfile_path} (file not found)")
-            return 2
-        except Exception as e:
-            parser.error(f"Unable to open bamfile {bamfile_path}: {str(e)}")
-            return 2
+        except Exception as exc:
+            parser.error(f"Unable to open bamfile {bamfile_path}: {exc}")
 
-    # Open FASTA if needed
     fasta = None
     if args.fasta:
         try:
             fasta = pysam.FastaFile(args.fasta)
-        except Exception as e:
-            parser.error(f"Unable to open FASTA '{args.fasta}': {str(e)}")
-            return 2
+        except Exception as exc:
+            parser.error(f"Unable to open FASTA '{args.fasta}': {exc}")
 
-    # Build list of regions to process
     contigs = []
     if args.contigs:
         for contig_range in args.contigs:
             if ":" in contig_range:
-                contig, positions = contig_range.split(":")
-                start, end = map(int, positions.split("-"))
+                contig, positions = contig_range.split(":", 1)
+                start, end = map(int, positions.split("-", 1))
                 contig_len = bamfiles[0].get_reference_length(contig)
                 contigs.extend(
                     split_into_regions(
-                        contig, start, end, contig_len,
+                        contig,
+                        start,
+                        end,
+                        contig_len,
                         max_length=args.chunk_bp,
-                        overlap=args.overlap_bp
+                        overlap=args.overlap_bp,
                     )
                 )
             else:
                 contig = contig_range
-                start, end = 0, bamfiles[0].get_reference_length(contig)
                 contig_len = bamfiles[0].get_reference_length(contig)
                 contigs.extend(
                     split_into_regions(
-                        contig, start, end, contig_len,
+                        contig,
+                        0,
+                        contig_len,
+                        contig_len,
                         max_length=args.chunk_bp,
-                        overlap=args.overlap_bp
+                        overlap=args.overlap_bp,
                     )
                 )
     else:
         for contig in bamfiles[0].references:
-            start, end = 0, bamfiles[0].get_reference_length(contig)
             contig_len = bamfiles[0].get_reference_length(contig)
             contigs.extend(
                 split_into_regions(
-                    contig, start, end, contig_len,
+                    contig,
+                    0,
+                    contig_len,
+                    contig_len,
                     max_length=args.chunk_bp,
-                    overlap=args.overlap_bp
+                    overlap=args.overlap_bp,
                 )
             )
 
-    # Fragment length range is used for all fragment-derived tracks.
-    # PNS kernels are only precomputed when PNS mode is on.
     pns_frag_range = range(args.frag_lower, args.frag_upper + 1)
     if args.pns_mode == "on":
         pns_distributions, pospns_distributions = precompute_distributions(
@@ -1289,191 +1713,267 @@ def main():
     else:
         pns_distributions, pospns_distributions = {}, {}
 
-    # Remove old outputs
-    combined_bedgraph = f"{args.out_prefix}_combined_scores.bedGraph"
-    nucleosome_bed_rich = f"{args.out_prefix}_nucleosome_regions.bed"
-    breakpoint_bed_rich = f"{args.out_prefix}_breakpoint_peaks.bed"
-    nucleosome_bed8 = f"{args.out_prefix}_nucleosome_regions.bed"
-    breakpoint_bed8 = f"{args.out_prefix}_breakpoint_peaks.bed"
-    frag_summary = f"{args.out_prefix}_fragment_summary.txt"
-    frag_lens = f"{args.out_prefix}_fragment_length_counts.tsv"
+    output_groups = ALL_OUTPUT_GROUPS if args.split_ww_types else ("all",)
 
-    # Track outputs
-    wig_paths = [f"{args.out_prefix}_{t}.wig.gz" for t in args.score_tracks]
+    # Remove outputs for all possible groups so stale type files from a previous
+    # run cannot be mistaken for current results.
+    to_remove = set()
+    cleanup_groups = ALL_OUTPUT_GROUPS
+    for group in cleanup_groups:
+        prefix = group_output_prefix(args.out_prefix, group)
+        to_remove.add(f"{prefix}_fragment_summary.txt")
+        to_remove.add(f"{prefix}_fragment_length_counts.tsv")
+        to_remove.add(f"{prefix}_nucleosome_regions.bed")
+        to_remove.add(f"{prefix}_breakpoint_peaks.bed")
+        to_remove.add(f"{prefix}_dinuc_profile.tsv")
+        if args.score_format in ("bedgraph", "both"):
+            to_remove.add(f"{prefix}_combined_scores.bedGraph")
+        if args.score_format in ("wiggz", "both"):
+            for track in valid_tracks:
+                to_remove.add(f"{prefix}_{track}.wig.gz")
 
-    to_remove = [frag_summary, frag_lens]
-    if args.score_format in ("bedgraph", "both"):
-        to_remove.append(combined_bedgraph)
-
-    # Always remove old peak BEDs for this prefix. When --pns-mode off, no new
-    # peak BEDs are written, so this prevents stale PNS peak files from a
-    # previous run being mistaken for current output.
-    if args.peak_format == "rich":
-        to_remove.extend([nucleosome_bed_rich, breakpoint_bed_rich])
-    else:
-        to_remove.extend([nucleosome_bed8, breakpoint_bed8])
-
-    if args.score_format in ("wiggz", "both"):
-        to_remove.extend(wig_paths)
-
-        # Also remove stale PNS wig outputs when PNS is disabled, even though
-        # those tracks have already been removed from args.score_tracks.
-        if args.pns_mode == "off":
-            for t in sorted({"pns", "posPNS", "pns_smoothed"}):
-                to_remove.append(f"{args.out_prefix}_{t}.wig.gz")
-
+    to_remove.add(f"{args.out_prefix}_ww_type_summary.tsv")
     for fname in to_remove:
         if os.path.exists(fname):
             os.remove(fname)
 
-    # Global fragment accounting
-    total_fragments_filtered_all = 0
-    total_fragments_used_in_range = 0
-    unique_bases_covered_by_used = 0
-    length_counts = Counter()
+    stats = {}
+    for group in output_groups:
+        stats[group] = {
+            "total_filtered": 0,
+            "total_used": 0,
+            "unique_bases": 0,
+            "length_counts": Counter(),
+        }
 
-    # Open wig.gz handles ONCE for the whole run
-    wig_handles = {}
+    type_counts = Counter()
+    dinuc_positions = expected_dinuc_profile_positions(
+        args.frag_lower, args.frag_upper
+    )
+    dinuc_accumulators = (
+        {group: new_dinuc_accumulator() for group in output_groups}
+        if args.dinuc_profile
+        else {}
+    )
+
+    wig_handles = {group: {} for group in output_groups}
     if args.score_format in ("wiggz", "both") and args.score_tracks:
-        for track in args.score_tracks:
-            path = f"{args.out_prefix}_{track}.wig.gz"
-            wig_handles[track] = gzip.open(path, "wt")
+        for group in output_groups:
+            prefix = group_output_prefix(args.out_prefix, group)
+            for track in args.score_tracks:
+                wig_handles[group][track] = gzip.open(
+                    f"{prefix}_{track}.wig.gz", "wt"
+                )
 
     first_region = True
-    for contig, adjusted_start, adjusted_end, original_start, original_end in tqdm(contigs, desc="Scoring contigs"):
-        scores, pns_frag_range, fragments_filtered = score_contig(
-            bamfiles=bamfiles,
-            contig=contig,
-            start=adjusted_start,
-            end=adjusted_end,
-            mode_DNA_length=args.mode_length,
-            pns_frag_range=pns_frag_range,
-            max_duplicates=args.max_duplicates,
-            pns_distributions=pns_distributions,
-            pospns_distributions=pospns_distributions,
-            subsample=args.subsample,
-            pns_mode=args.pns_mode,
-            randomize_mode=args.randomize_mode,
-            fasta=fasta,
-            anchor_prob_start=args.anchor_prob_start,
-            max_anchor_tries=args.max_anchor_tries,
-            randomize_fallback=args.randomize_fallback,
-            dedup_scope=args.dedup_scope,
-        )
+    need_reference_sequence = reference_required
 
-        # ---- Assign fragments to chunk by START in ORIGINAL window ----
-        owned_fragments = []
-        for frag_start, frag_end in fragments_filtered:
-            if original_start <= frag_start < original_end:
-                owned_fragments.append((frag_start, frag_end))
+    try:
+        for (
+            contig,
+            adjusted_start,
+            adjusted_end,
+            original_start,
+            original_end,
+        ) in tqdm(contigs, desc="Scoring contigs"):
+            (
+                scores_by_group,
+                pns_frag_range,
+                fragment_records,
+                reference_context,
+            ) = score_contig(
+                bamfiles=bamfiles,
+                contig=contig,
+                start=adjusted_start,
+                end=adjusted_end,
+                mode_DNA_length=args.mode_length,
+                pns_frag_range=pns_frag_range,
+                max_duplicates=args.max_duplicates,
+                pns_distributions=pns_distributions,
+                pospns_distributions=pospns_distributions,
+                subsample=args.subsample,
+                pns_mode=args.pns_mode,
+                randomize_mode=args.randomize_mode,
+                fasta=fasta,
+                anchor_prob_start=args.anchor_prob_start,
+                max_anchor_tries=args.max_anchor_tries,
+                randomize_fallback=args.randomize_fallback,
+                dedup_scope=args.dedup_scope,
+                split_ww_types=args.split_ww_types,
+                need_reference_sequence=need_reference_sequence,
+            )
 
-        total_fragments_filtered_all += len(owned_fragments)
+            owned_records = [
+                record
+                for record in fragment_records
+                if original_start <= record[0] < original_end
+            ]
+            stats["all"]["total_filtered"] += len(owned_records)
 
-        if original_end > original_start:
-            covered = np.zeros(original_end - original_start, dtype=bool)
+            covered_by_group = {
+                group: np.zeros(original_end - original_start, dtype=bool)
+                for group in output_groups
+            }
 
-            for frag_start, frag_end in owned_fragments:
-                L = frag_end - frag_start
-                if L not in pns_frag_range:
+            for frag_start, frag_end, ww_type in owned_records:
+                frag_length = frag_end - frag_start
+                if frag_length not in pns_frag_range:
                     continue
 
-                total_fragments_used_in_range += 1
-                length_counts[L] += 1
+                stats["all"]["total_used"] += 1
+                stats["all"]["length_counts"][frag_length] += 1
+
+                targets = ["all"]
+                if args.split_ww_types:
+                    if ww_type in WW_TYPE_GROUPS:
+                        type_counts[ww_type] += 1
+                        targets.append(ww_type)
+                        stats[ww_type]["total_filtered"] += 1
+                        stats[ww_type]["total_used"] += 1
+                        stats[ww_type]["length_counts"][frag_length] += 1
+                    else:
+                        type_counts["unclassified"] += 1
 
                 ov_start = max(frag_start, original_start)
                 ov_end = min(frag_end, original_end)
                 if ov_end > ov_start:
-                    covered[ov_start - original_start : ov_end - original_start] = True
+                    for group in targets:
+                        covered_by_group[group][
+                            ov_start - original_start : ov_end - original_start
+                        ] = True
 
-            unique_bases_covered_by_used += int(covered.sum())
+                if args.dinuc_profile:
+                    fragment_seq = extract_reference_sequence(
+                        fasta=fasta,
+                        reference_context=reference_context,
+                        seq_start=frag_start,
+                        seq_end=frag_end,
+                    )
+                    for group in targets:
+                        add_fragment_to_dinuc_accumulator(
+                            accumulator=dinuc_accumulators[group],
+                            fragment_seq=fragment_seq,
+                            frag_start=frag_start,
+                            frag_end=frag_end,
+                        )
 
-        coverage_scores = scores["coverage"][0][2]
+            for group in output_groups:
+                stats[group]["unique_bases"] += int(covered_by_group[group].sum())
 
-        # PNS-based peak calling is skipped entirely when --pns-mode off.
-        if args.pns_mode == "on":
-            pns_smoothed_scores = scores["pns_smoothed"][0][2]
+            for group in output_groups:
+                scores = scores_by_group[group]
+                prefix = group_output_prefix(args.out_prefix, group)
+                coverage_scores = scores["coverage"][0][2]
 
-            # Nucleosome regions
-            call_and_write_peaks(
-                scores=pns_smoothed_scores,
-                coverage_scores=coverage_scores,
-                adjusted_start=adjusted_start,
-                original_start=original_start,
-                original_end=original_end,
-                contig=contig,
+                if args.pns_mode == "on":
+                    pns_smoothed_scores = scores["pns_smoothed"][0][2]
+                    call_and_write_peaks(
+                        scores=pns_smoothed_scores,
+                        coverage_scores=coverage_scores,
+                        adjusted_start=adjusted_start,
+                        original_start=original_start,
+                        original_end=original_end,
+                        contig=contig,
+                        out_prefix=prefix,
+                        first_region=first_region,
+                        peak_type_label="_nucleosome_regions",
+                        flip_scores=False,
+                        peak_format=args.peak_format,
+                        peak_score_scale=args.peak_score_scale,
+                        min_region_length=args.min_region_length,
+                        max_neg_run=args.max_neg_run,
+                    )
+                    call_and_write_peaks(
+                        scores=-1 * pns_smoothed_scores,
+                        coverage_scores=coverage_scores,
+                        adjusted_start=adjusted_start,
+                        original_start=original_start,
+                        original_end=original_end,
+                        contig=contig,
+                        out_prefix=prefix,
+                        first_region=first_region,
+                        peak_type_label="_breakpoint_peaks",
+                        flip_scores=True,
+                        peak_format=args.peak_format,
+                        peak_score_scale=args.peak_score_scale,
+                        min_region_length=args.min_region_length,
+                        max_neg_run=args.max_neg_run,
+                    )
+
+                if args.score_format in ("bedgraph", "both"):
+                    write_bedgraph(
+                        scores,
+                        [(original_start, original_end)],
+                        prefix,
+                        first_region,
+                    )
+
+                if args.score_format in ("wiggz", "both") and args.score_tracks:
+                    write_wig_gz_tracks(
+                        scores=scores,
+                        contig=contig,
+                        adjusted_start=adjusted_start,
+                        original_start=original_start,
+                        original_end=original_end,
+                        handles=wig_handles[group],
+                        tracks=args.score_tracks,
+                    )
+
+            first_region = False
+
+        for group in output_groups:
+            prefix = group_output_prefix(args.out_prefix, group)
+            write_fragment_outputs(
+                out_prefix=prefix,
+                total_fragments_filtered_all=stats[group]["total_filtered"],
+                total_fragments_used_in_range=stats[group]["total_used"],
+                unique_bases_covered_by_used=stats[group]["unique_bases"],
+                length_counts=stats[group]["length_counts"],
+                dedup_scope=args.dedup_scope,
+                max_duplicates=args.max_duplicates,
+            )
+
+            if args.dinuc_profile:
+                write_dinuc_profile(
+                    out_path=f"{prefix}_dinuc_profile.tsv",
+                    accumulator=dinuc_accumulators[group],
+                    positions=dinuc_positions,
+                    fraction=args.dinuc_fraction,
+                )
+
+        if args.split_ww_types:
+            write_ww_type_summary(
                 out_prefix=args.out_prefix,
-                first_region=first_region,
-                peak_type_label="_nucleosome_regions",
-                flip_scores=False,
-                peak_format=args.peak_format,
-                peak_score_scale=args.peak_score_scale,
-                min_region_length=args.min_region_length,
-                max_neg_run=args.max_neg_run,
+                type_counts=type_counts,
+                total_in_range=stats["all"]["total_used"],
             )
 
-            # Breakpoint peaks (flip sign)
-            flipped_scores = -1 * pns_smoothed_scores
-            call_and_write_peaks(
-                scores=flipped_scores,
-                coverage_scores=coverage_scores,
-                adjusted_start=adjusted_start,
-                original_start=original_start,
-                original_end=original_end,
-                contig=contig,
-                out_prefix=args.out_prefix,
-                first_region=first_region,
-                peak_type_label="_breakpoint_peaks",
-                flip_scores=True,
-                peak_format=args.peak_format,
-                peak_score_scale=args.peak_score_scale,
-                min_region_length=args.min_region_length,
-                max_neg_run=args.max_neg_run,
+    finally:
+        for group_handles in wig_handles.values():
+            for handle in group_handles.values():
+                try:
+                    handle.close()
+                except Exception:
+                    pass
+        for bam in bamfiles:
+            try:
+                bam.close()
+            except Exception:
+                pass
+        if fasta is not None:
+            try:
+                fasta.close()
+            except Exception:
+                pass
+
+    if args.dinuc_profile:
+        for group in output_groups:
+            acc = dinuc_accumulators[group]
+            print(
+                f"[INFO] {group} dinucleotide fragments used: "
+                f"{acc['fragments_used']:,}; skipped: {acc['fragments_skipped']:,}",
+                file=sys.stderr,
             )
-
-        # Per-base scores, trimmed to non-overlap region
-        if args.score_format in ("bedgraph", "both"):
-            write_bedgraph(scores, [(original_start, original_end)], args.out_prefix, first_region)
-
-        if args.score_format in ("wiggz", "both") and args.score_tracks:
-            write_wig_gz_tracks(
-                scores=scores,
-                contig=contig,
-                adjusted_start=adjusted_start,
-                original_start=original_start,
-                original_end=original_end,
-                handles=wig_handles,
-                tracks=args.score_tracks,
-            )
-
-        first_region = False
-
-    write_fragment_outputs(
-        out_prefix=args.out_prefix,
-        total_fragments_filtered_all=total_fragments_filtered_all,
-        total_fragments_used_in_range=total_fragments_used_in_range,
-        unique_bases_covered_by_used=unique_bases_covered_by_used,
-        length_counts=length_counts,
-        dedup_scope=args.dedup_scope,
-        max_duplicates=args.max_duplicates,
-    )
-
-    for f in wig_handles.values():
-        try:
-            f.close()
-        except Exception:
-            pass
-
-    for b in bamfiles:
-        try:
-            b.close()
-        except Exception:
-            pass
-
-    if fasta is not None:
-        try:
-            fasta.close()
-        except Exception:
-            pass
 
     return 0
 
