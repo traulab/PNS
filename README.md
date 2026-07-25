@@ -6,8 +6,8 @@ from paired-end sequencing data.
 
 The pipeline reads one or more coordinate-sorted BAM files, filters
 paired-end fragments, computes probabilistic nucleosome scores (PNS),
-coverage, dyad and fragment-end tracks, and optionally identifies
-nucleosome protection peaks and breakpoint hotspots. Additional modules
+coverage, dyad and fragment-end tracks, and identifies
+nucleosome protection peaks and breakpoint peaks. Additional modules
 allow fragment randomisation, sequence-based WW/SS classification, and
 aligned dinucleotide profiling.
 
