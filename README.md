@@ -1,250 +1,334 @@
 # PNS with Nucleosome and Breakpoint Peak Calling
 
-**PNS (Probabilistic Nucleosome Scoring)** is a fragmentomics pipeline
-for generating high-resolution nucleosome protection and breakpoint maps
-from paired-end sequencing data.
+**PNS (Probabilistic Nucleosome Scoring)** is a fragmentomics pipeline for generating high-resolution nucleosome protection and breakpoint maps from paired-end sequencing data.
 
-The pipeline reads one or more coordinate-sorted BAM files, filters
-paired-end fragments, computes probabilistic nucleosome scores (PNS),
-coverage, dyad and fragment-end tracks, and identifies
-nucleosome protection peaks and breakpoint peaks. Additional modules
-allow fragment randomisation, sequence-based WW/SS classification, and
-aligned dinucleotide profiling.
+The pipeline reads one or more coordinate-sorted BAM files, filters paired-end fragments, computes probabilistic nucleosome scores (PNS), identifies nucleosome protection and breakpoint peaks, and outputs coverage, dyad and fragment-end tracks. Additional modules support fragment randomisation, WW/SS sequence classification, and aligned dinucleotide profiling.
 
-Outputs are written directly as **BigWig** files by default, with
-optional **WIG** output and BED-formatted peak calls.
+Outputs are written directly as **BigWig** files by default, with optional compressed WIG output and BED-formatted peak calls.
 
-------------------------------------------------------------------------
+---
 
-# Features
+## Features
 
-## Core scoring
+### Core scoring
 
--   Calculates **Probabilistic Nucleosome Score (PNS)** tracks from
-    paired-end fragments
--   Generates raw and Savitzky--Golay smoothed PNS tracks
--   Produces:
-    -   coverage
-    -   dyad density
-    -   fragment-end density
-    -   left-end density
-    -   right-end density
+The pipeline can generate:
 
-## Peak calling
+- raw PNS
+- Savitzky–Golay-smoothed PNS
+- positive-only PNS
+- fragment coverage
+- dyad density
+- combined fragment-end density
+- left fragment-end density
+- right fragment-end density
 
-Calls two complementary classes of peaks from the smoothed PNS signal:
+### Peak calling
 
--   **Nucleosome protection peaks** (positive PNS regions)
--   **Breakpoint peaks** (negative PNS regions)
+Two complementary classes of peaks are called from the smoothed PNS signal:
 
-Both are written as BED files suitable for downstream analysis or genome
-browsers.
+- **Nucleosome protection peaks** from positive PNS regions
+- **Breakpoint peaks** from negative PNS regions
 
-## Fragment processing
+Both peak files are written in **BED8** format with the following columns:
 
-Supports:
+| Column | Name | Description |
+|:------:|------|-------------|
+| 1 | **chrom** | Chromosome or contig name. |
+| 2 | **start** | Start coordinate of the called region (0-based, inclusive). |
+| 3 | **end** | End coordinate of the called region (0-based, end-exclusive). |
+| 4 | **name** | Peak identifier, indicating the genomic position and peak type (nucleosome or breakpoint). |
+| 5 | **score** | Integer peak score calculated from the scaled peak prominence. |
+| 6 | **strand** | Strand field (`.`); peaks are not strand-specific. |
+| 7 | **thickStart** | Genomic coordinate of the peak summit. |
+| 8 | **thickEnd** | Peak summit coordinate + 1, defining a 1 bp summit interval. |
 
--   multiple BAM inputs
--   coordinate-based duplicate filtering
--   deduplication across all BAMs or within individual BAMs
--   fragment length filtering
--   optional random subsampling
+### Fragment processing
 
-## Fragment randomisation
+The pipeline supports:
 
-  -----------------------------------------------------------------------
-  Mode                     Description
-  ------------------------ ----------------------------------------------
-  none                     No randomisation
+- one or more paired-end BAM files
+- pooling all BAMs in a directory with a shell wildcard such as `*.bam`
+- fragment-length filtering
+- coordinate-based duplicate filtering
+- deduplication within each BAM or across all BAMs
+- optional random subsampling
+- chromosome, contig-range, interval, autosome, or whole-genome analysis
 
-  uniform                  Randomises fragment positions while preserving
-                           fragment length
+### Fragment randomisation
 
-  dinuc_anchor             Preserves fragment boundary dinucleotides by
-                           relocating fragments to matching reference
-                           sequence positions
-  -----------------------------------------------------------------------
+Two randomisation modes are available:
 
-The dinucleotide-anchor mode requires a reference FASTA.
+- **`uniform`**  
+  Randomise fragment positions within each processed window while preserving fragment length.
 
-## WW/SS sequence classification
+- **`dinuc_anchor`**  
+  Relocate fragments to reference positions with matching fragment-boundary dinucleotides. This mode preserves the selected start- or end-boundary dinucleotide and requires an indexed reference FASTA.
 
-Fragments can optionally be classified into the four canonical WW/SS
-nucleosome sequence classes using a centred 147 bp reference sequence.
+### WW/SS sequence classification
 
-When enabled the pipeline automatically produces independent outputs
-for:
+Fragments can optionally be classified into four WW/SS nucleosome sequence classes using a centred 147 bp sequence around the fragment dyad:
 
--   Type 1
--   Type 2
--   Type 3
--   Type 4
+- Type 1
+- Type 2
+- Type 3
+- Type 4
 
-while also retaining the standard all-fragment outputs.
+When enabled, the pipeline produces separate outputs for each class while retaining the combined all-fragment outputs.
 
-## Dinucleotide profiling
+### Dinucleotide profiling
 
-Optionally calculates observed dinucleotide frequencies aligned relative
-to fragment dyads.
+The pipeline can calculate aligned dinucleotide frequencies relative to fragment dyads.
 
 Outputs include:
 
--   all 16 dinucleotides
--   combined WW frequencies
--   combined SS frequencies
+- all 16 dinucleotides
+- combined WW frequencies
+- combined SS frequencies
 
-Values may be written as percentages or fractions.
+Values can be written as percentages or fractions.
 
-## Flexible genome selection
+### Flexible contig selection
 
-Examples include:
+Examples of valid contig selections include:
 
-``` text
+```text
 chr1
 chr1,chr2,chr3
 chr1-22
+chr1-22,chrX,chrY
 autosomes
 all
 chr12:100000-200000
 ```
 
-Large chromosomes are processed automatically in overlapping windows to
-minimise memory usage.
+Large contigs are processed automatically in overlapping windows to reduce memory usage.
 
-------------------------------------------------------------------------
+---
 
-# Requirements
+## Requirements
 
-Python ≥3.9
+- Python 3
+- `numpy`
+- `scipy`
+- `pysam`
+- `pyBigWig`
 
-Required packages:
+Install the Python dependencies with:
 
-``` text
-numpy
-scipy
-pysam
-pyBigWig
+```bash
+python -m pip install numpy scipy pysam pyBigWig
 ```
 
-------------------------------------------------------------------------
+Input BAM files must be coordinate sorted and indexed.
 
-# Quick Start
+---
 
-## Whole genome
+## Quick start
 
-``` bash
+### Single BAM
+
+```bash
 python PNS_with_nucleosome_peak_calling.py \
     -b sample.bam
 ```
 
-## Selected chromosomes
+### All BAMs in the current directory
 
-``` bash
+The shell expands `*.bam` into all matching BAM filenames before running the script:
+
+```bash
+python PNS_with_nucleosome_peak_calling.py \
+    -b *.bam
+```
+
+All BAMs in another directory can be supplied in the same way:
+
+```bash
+python PNS_with_nucleosome_peak_calling.py \
+    -b /path/to/bams/*.bam
+```
+
+Do not place quotes around `*.bam`, because the shell must expand the wildcard.
+
+### Multiple explicitly named BAMs
+
+```bash
+python PNS_with_nucleosome_peak_calling.py \
+    -b sample1.bam sample2.bam sample3.bam
+```
+
+### Selected chromosomes
+
+```bash
 python PNS_with_nucleosome_peak_calling.py \
     -b sample.bam \
     -c chr1-22,chrX
 ```
 
-## Pool multiple BAMs
+### A genomic interval
 
-``` bash
+Coordinates use a 0-based start and end-exclusive end:
+
+```bash
 python PNS_with_nucleosome_peak_calling.py \
-    -b sample1.bam sample2.bam sample3.bam
+    -b sample.bam \
+    -c chr12:52621135-52641135
 ```
 
-## Generate WW type outputs
+### Custom fragment-length range
 
-``` bash
+```bash
+python PNS_with_nucleosome_peak_calling.py \
+    -b sample.bam \
+    --frag-lower 147 \
+    --frag-upper 187
+```
+
+### Pool BAMs and deduplicate across all inputs
+
+```bash
+python PNS_with_nucleosome_peak_calling.py \
+    -b /path/to/bams/*.bam \
+    --dedup-scope all_bams \
+    --max-duplicates 0
+```
+
+### Generate WW/SS type outputs
+
+```bash
 python PNS_with_nucleosome_peak_calling.py \
     -b sample.bam \
     --split-ww-types \
     --fasta hg38.fa
 ```
 
-## Generate aligned dinucleotide profiles
+### Generate aligned dinucleotide profiles
 
-``` bash
+```bash
 python PNS_with_nucleosome_peak_calling.py \
     -b sample.bam \
     --dinuc-profile \
     --fasta hg38.fa
 ```
 
-------------------------------------------------------------------------
+### Generate both WW/SS types and dinucleotide profiles
 
-# Main Options
-
-## Input
-
-``` text
--b / --bamfiles
--c / --contigs
--o / --out_prefix
+```bash
+python PNS_with_nucleosome_peak_calling.py \
+    -b sample.bam \
+    --split-ww-types \
+    --dinuc-profile \
+    --fasta hg38.fa
 ```
 
-## Fragment filtering
+### Disable PNS scoring
 
-``` text
---frag-lower
---frag-upper
---max-duplicates
---dedup-scope
---subsample
+This can be useful when only coverage, dyad, fragment-end, WW/SS, or dinucleotide outputs are required:
+
+```bash
+python PNS_with_nucleosome_peak_calling.py \
+    -b sample.bam \
+    --pns-mode off
 ```
 
-## PNS
+---
 
-``` text
---mode-length
---pns-mode
+## Main options
+
+### Input and regions
+
+```text
+-b, --bamfiles       One or more paired-end BAM files
+-o, --out-prefix     Output prefix
+-c, --contigs        Contigs, ranges, aliases, or genomic intervals
 ```
 
-## Randomisation
+### Fragment filtering
 
-``` text
---randomize-mode
---fasta
---anchor-prob-start
---randomize-fallback
+```text
+--frag-lower         Minimum fragment length
+--frag-upper         Maximum fragment length
+--max-duplicates     Number of additional identical coordinate copies allowed
+--dedup-scope        Apply coordinate deduplication within each BAM or across all BAMs
+--subsample          Randomly retain fragments with probability p
 ```
 
-## Sequence analysis
+`--max-duplicates 0` retains one copy of each identical fragment coordinate.  
+`--max-duplicates 1` retains up to two copies, and so on.
 
-``` text
---split-ww-types
---dinuc-profile
---dinuc-fraction
+### PNS scoring
+
+```text
+--mode-length        Fragment length used to define the PNS kernel geometry
+--pns-mode           Enable or disable PNS scoring
 ```
 
-## Output
+### Fragment randomisation
 
-``` text
---pns-format
---other-format
---pns-tracks
---other-tracks
+```text
+--randomize-mode     none, uniform, or dinuc_anchor
+--fasta              Indexed reference FASTA
+--anchor-prob-start  Probability of preserving the start-boundary dinucleotide
+--max-anchor-tries   Maximum placement attempts for dinucleotide anchoring
+--randomize-fallback Action when no valid anchored placement is found
+--seed               Random seed
 ```
 
-## Peak calling
+### Sequence analysis
 
-``` text
---peak-format
---min-region-length
---max-neg-run
+```text
+--split-ww-types     Produce separate Type 1-4 WW/SS outputs
+--dinuc-profile      Calculate dyad-aligned dinucleotide profiles
+--dinuc-fraction     Write dinucleotide values as fractions rather than percentages
+--fasta              Indexed reference FASTA required for sequence-based analyses
 ```
 
-------------------------------------------------------------------------
+### Output controls
 
-# Output Files
+```text
+--pns-format         Output format for PNS tracks
+--other-format       Output format for non-PNS tracks
+--pns-tracks         Select which PNS tracks to write
+--other-tracks       Select coverage, dyad, and fragment-end tracks
+```
 
-## Score tracks
+BigWig is the default output format. Compressed WIG output can also be requested where supported.
 
-Direct **BigWig** output (default):
+### Peak calling
 
-``` text
-*_pns_smoothed.bw
+```text
+--peak-format        Peak output format
+--min-region-length  Minimum length of a called positive region
+--max-neg-run        Number of non-positive bases tolerated within a region
+--peak-score-scale   Scale factor used for BED scores
+```
+
+---
+
+## Output files
+
+Output names include the selected PNS mode length and fragment-length range.
+
+A typical prefix has the form:
+
+```text
+<out_prefix>_PNS_mode<MODE>_lower<LOWER>_upper<UPPER>
+```
+
+The exact files produced depend on the selected tracks and analysis options.
+
+### PNS tracks
+
+```text
 *_pns.bw
+*_pns_smoothed.bw
 *_posPNS.bw
+```
+
+### Fragment tracks
+
+```text
 *_coverage.bw
 *_dyad.bw
 *_fragment_ends.bw
@@ -252,47 +336,58 @@ Direct **BigWig** output (default):
 *_fragment_right_ends.bw
 ```
 
-Optional compressed WIG output:
+Optional compressed WIG outputs use:
 
-``` text
+```text
 *.wig.gz
 ```
 
-## Peak calls
+### Peak calls
 
-``` text
+```text
 *_nucleosome_regions.bed
 *_breakpoint_peaks.bed
 ```
 
-## Sequence analysis
+### Sequence-analysis outputs
 
-``` text
+```text
 *_dinuc_profile.tsv
 *_ww_type_summary.tsv
 ```
 
-## Fragment summaries
+When `--split-ww-types` is enabled, Type 1-4 outputs are written separately in addition to the combined all-fragment outputs.
 
-``` text
+### Fragment summaries
+
+```text
 *_fragment_summary.txt
 *_fragment_length_counts.tsv
 ```
 
-When `--split-ww-types` is enabled, each WW/SS class receives its own
-complete set of outputs in addition to the combined all-fragment
-results.
+The summary files report fragment totals, fragment-length counts, and other run-level statistics.
 
-------------------------------------------------------------------------
+---
 
-# Pipeline Overview
+## Pipeline overview
 
-1.  Read paired-end fragments from one or more BAM files.
-2.  Apply filtering, deduplication and optional subsampling.
-3.  Optionally randomise fragment positions.
-4.  Optionally classify fragments into WW/SS Types 1--4.
-5.  Compute PNS, coverage, dyad and fragment-end tracks.
-6.  Optionally generate aligned dinucleotide profiles.
-7.  Smooth the PNS signal using a Savitzky--Golay filter.
-8.  Identify nucleosome protection peaks and breakpoint peaks.
-9.  Write all requested tracks and summary files.
+1. Read paired-end alignments from one or more indexed BAM files.
+2. Reconstruct fragments and apply alignment and fragment-length filters.
+3. Apply coordinate deduplication and optional subsampling.
+4. Optionally randomise fragment positions.
+5. Optionally classify fragments into WW/SS Types 1-4.
+6. Calculate the requested PNS and fragment-based tracks.
+7. Optionally calculate dyad-aligned dinucleotide profiles.
+8. Smooth the raw PNS signal.
+9. Call nucleosome protection and breakpoint peaks.
+10. Write BigWig or WIG tracks, BED peak calls, and summary files.
+
+---
+
+## Notes
+
+- BAM files must be coordinate sorted and indexed.
+- A wildcard such as `*.bam` is expanded by the shell, not by Python.
+- Region coordinates use a 0-based start and an end-exclusive end.
+- Reference-based modes require a FASTA file with a corresponding `.fai` index.
+- Large contigs are processed in overlapping chunks, but only the non-overlapping core of each chunk is written.
