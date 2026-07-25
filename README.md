@@ -249,7 +249,7 @@ python PNS_with_nucleosome_peak_calling.py \
 ```text
 --frag-lower         Minimum fragment length
 --frag-upper         Maximum fragment length
---max-duplicates     Number of additional identical coordinate copies allowed
+--max-duplicates     Number of identical coordinate copies allowed
 --dedup-scope        Apply coordinate deduplication within each BAM or across all BAMs
 --subsample          Randomly retain fragments with probability p
 ```
