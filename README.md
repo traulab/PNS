@@ -38,7 +38,7 @@ Both peak files are written in **BED8** format with the following columns:
 | 2 | **start** | Start coordinate of the called region (0-based, inclusive). |
 | 3 | **end** | End coordinate of the called region (0-based, end-exclusive). |
 | 4 | **name** | Peak identifier, indicating the genomic position and peak type (nucleosome or breakpoint). |
-| 5 | **score** | Integer peak score calculated from the scaled peak prominence. |
+| 5 | **score** | Maximum smoothed PNS signal within the called region. |
 | 6 | **strand** | Strand field (`.`); peaks are not strand-specific. |
 | 7 | **thickStart** | Genomic coordinate of the peak summit. |
 | 8 | **thickEnd** | Peak summit coordinate + 1, defining a 1 bp summit interval. |
