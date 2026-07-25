@@ -191,7 +191,7 @@ python PNS_with_nucleosome_peak_calling.py \
 python PNS_with_nucleosome_peak_calling.py \
     -b /path/to/bams/*.bam \
     --dedup-scope all_bams \
-    --max-duplicates 0
+    --max-duplicates 1
 ```
 
 ### Generate WW/SS type outputs
