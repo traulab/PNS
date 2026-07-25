@@ -254,9 +254,9 @@ python PNS_with_nucleosome_peak_calling.py \
 --subsample          Randomly retain fragments with probability p
 ```
 
---max-duplicates 0 disables coordinate-based deduplication and retains all fragments.
---max-duplicates 1 retains one copy of each identical fragment coordinate.
---max-duplicates 2 retains up to two copies, and so on.
+`--max-duplicates 0` disables coordinate-based deduplication and retains all fragments.  
+`--max-duplicates 1` retains one copy of each identical fragment coordinate.  
+`--max-duplicates 2` retains up to two copies, and so on.
 
 ### PNS scoring
 
